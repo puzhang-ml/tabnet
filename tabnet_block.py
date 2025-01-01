@@ -45,7 +45,6 @@ class FeatTransformer(tf.keras.layers.Layer):
         self.n_independent = n_independent
         self.n_shared = n_shared
         
-        # Independent layers
         self.independent = [
             GLU_Block(
                 input_dim if i == 0 else output_dim,
@@ -55,7 +54,6 @@ class FeatTransformer(tf.keras.layers.Layer):
             ) for i in range(n_independent)
         ]
         
-        # Shared layers
         self.shared = [
             GLU_Block(
                 input_dim if i == 0 else output_dim,
@@ -66,12 +64,9 @@ class FeatTransformer(tf.keras.layers.Layer):
         ]
 
     def call(self, x, training=None):
-        # Independent GLU Blocks
         out = x
         for layer in self.independent:
             out = layer(out, training=training)
-            
-        # Shared GLU Blocks
         for layer in self.shared:
             out = layer(out, training=training)
         return out
@@ -175,29 +170,14 @@ class TabNetEncoder(tf.keras.Model):
             mask = sparsemax(mask)
         return mask
 
-class FeatureProcessor:
-    def __init__(self, feature_config: dict):
-        self.feature_config = feature_config
-        self.total_dims = feature_config['total_dims']
-        
-    def process_features(self, feature_dict: Dict[str, tf.Tensor]) -> tf.Tensor:
-        """Convert dictionary of features into a single concatenated tensor"""
-        features_list = []
-        
-        for feature_name, info in self.feature_config.items():
-            if feature_name != 'total_dims':
-                tensor = feature_dict[feature_name]
-                features_list.append(tensor)
-        
-        return tf.concat(features_list, axis=1)
-
 def create_feature_config(feature_dict: Dict[str, tf.Tensor]) -> dict:
     """Create feature configuration from a feature dictionary"""
     config = {}
     total_dims = 0
     
     for feature_name, tensor in feature_dict.items():
-        feature_dims = tensor.shape[-1]
+        # Always use dynamic shape
+        feature_dims = tf.shape(tensor)[-1]
         config[feature_name] = {
             'start_idx': total_dims,
             'end_idx': total_dims + feature_dims,
@@ -208,17 +188,26 @@ def create_feature_config(feature_dict: Dict[str, tf.Tensor]) -> dict:
     config['total_dims'] = total_dims
     return config
 
-def create_group_matrix(feature_config: dict) -> np.ndarray:
+def create_group_matrix(feature_config: dict) -> tf.Tensor:
     """Create group matrix where each feature is treated as one group"""
     total_dims = feature_config['total_dims']
     n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims' key
-    group_matrix = np.zeros((total_dims, n_features))
+    
+    # Convert to tf.Tensor instead of numpy array
+    group_matrix = tf.zeros((total_dims, n_features))
     
     for idx, (feature_name, info) in enumerate(feature_config.items()):
         if feature_name != 'total_dims':
             start_idx = info['start_idx']
             end_idx = info['end_idx']
-            group_matrix[start_idx:end_idx, idx] = 1
+            # Use tensor operations instead of numpy
+            indices = tf.range(start_idx, end_idx)
+            updates = tf.ones(end_idx - start_idx)
+            group_matrix = tf.tensor_scatter_nd_update(
+                group_matrix,
+                tf.stack([indices, tf.fill(indices.shape, idx)], axis=1),
+                updates
+            )
             
     return group_matrix
 
@@ -261,4 +250,20 @@ class TabNet(tf.keras.Model):
         # Process dictionary input into tensor
         x_processed = self.feature_processor.process_features(inputs)
         steps_output, M_loss = self.tabnet(x_processed, training=training)
-        return steps_output[-1]  # Return last step output 
+        return steps_output[-1]  # Return last step output
+
+class FeatureProcessor:
+    def __init__(self, feature_config: dict):
+        self.feature_config = feature_config
+        self.total_dims = feature_config['total_dims']
+        
+    def process_features(self, feature_dict: Dict[str, tf.Tensor]) -> tf.Tensor:
+        """Convert dictionary of features into a single concatenated tensor"""
+        features_list = []
+        
+        for feature_name, info in self.feature_config.items():
+            if feature_name != 'total_dims':
+                tensor = feature_dict[feature_name]
+                features_list.append(tensor)
+        
+        return tf.concat(features_list, axis=1) 
