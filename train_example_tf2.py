@@ -21,6 +21,13 @@ def generate_sample_data(batch_size: int = 32) -> Dict[str, tf.Tensor]:
         'categorical_embedding': tf.random.normal((batch_size, 12))
     }
 
+def validate_features(feature_dict: Dict[str, tf.Tensor]):
+    """Validate feature dictionary"""
+    for key, tensor in feature_dict.items():
+        if tensor is None:
+            raise ValueError(f"Feature '{key}' has None value")
+        print(f"Feature '{key}' shape: {tensor.shape}, dtype: {tensor.dtype}")
+
 def main():
     # Sample configuration
     config = {
@@ -33,14 +40,29 @@ def main():
     }
     
     # Generate sample data
+    print("Generating sample data...")
     sample_data = generate_sample_data()
     
+    # Validate features
+    print("\nValidating features:")
+    validate_features(sample_data)
+    
     # Create feature configuration
+    print("\nCreating feature configuration...")
     feature_config = create_feature_config(sample_data)
-    print("\nFeature Configuration:")
     print(json.dumps(feature_config, indent=2))
     
+    # Validate feature config
+    print("\nValidating feature configuration:")
+    total_dims = 0
+    for key, info in feature_config.items():
+        if key != 'total_dims':
+            print(f"Feature '{key}': start_idx={info['start_idx']}, end_idx={info['end_idx']}, dims={info['dims']}")
+            total_dims += info['dims']
+    print(f"Calculated total_dims: {total_dims}, Config total_dims: {feature_config['total_dims']}")
+    
     # Initialize model
+    print("\nInitializing TabNet model...")
     model = TabNet(
         feature_config=feature_config,
         feature_dim=config.get("tabnet_feature_dim", 512),
@@ -52,8 +74,15 @@ def main():
     )
     
     # Test forward pass
-    output = model(sample_data, training=True)
-    print("\nOutput shape:", output.shape)
+    print("\nPerforming forward pass...")
+    try:
+        output = model(sample_data, training=True)
+        print("Output shape:", output.shape)
+    except Exception as e:
+        print("Error during forward pass:")
+        print(f"Error type: {type(e)}")
+        print(f"Error message: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
