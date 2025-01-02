@@ -40,7 +40,8 @@ class TabNetTests(tf.test.TestCase):
         # Create tf.function for graph mode
         @tf.function
         def run_model(features):
-            return model(features, training=True)
+            output, _, _ = model(features, training=True)
+            return output
             
         features = self.create_test_features_list()
         output = run_model(features)
@@ -57,7 +58,8 @@ class TabNetTests(tf.test.TestCase):
         
         @tf.function
         def run_model(features):
-            return model(features, training=True)
+            output, _, _ = model(features, training=True)
+            return output
             
         features = self.create_test_features_dict()
         output = run_model(features)
@@ -74,7 +76,7 @@ class TabNetTests(tf.test.TestCase):
         
         # Create single tensor input
         features = tf.random.normal((self.batch_size, 60))
-        output = model(features, training=True)
+        output, _, _ = model(features, training=True)
         
         # Check output shape
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
@@ -92,37 +94,81 @@ class TabNetTests(tf.test.TestCase):
             output_dim=self.output_dim
         )
         
-        output = model(features, training=True)
+        output, _, _ = model(features, training=True)
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
         
     def test_mixed_feature_types(self):
         """Test TabNet with mixed feature types (scalar, embedding, regular)"""
+        # Create feature dimensions
+        scalar_dim = 1
+        embedding1_dim = 16
+        embedding2_dim = 32
+        continuous1_dim = 10
+        continuous2_dim = 20
+        total_dims = scalar_dim * 2 + embedding1_dim + embedding2_dim + continuous1_dim + continuous2_dim
+        
+        # Create group matrix for embeddings
+        group_matrix = np.zeros((self.feature_dim, self.feature_dim))
+        current_idx = 2  # After two scalar features
+        
+        # Group embedding1 dimensions
+        embedding1_start = current_idx
+        embedding1_end = embedding1_start + embedding1_dim
+        group_matrix[embedding1_start:embedding1_end, embedding1_start:embedding1_end] = 1
+        current_idx = embedding1_end
+        
+        # Group embedding2 dimensions
+        embedding2_start = current_idx
+        embedding2_end = embedding2_start + embedding2_dim
+        group_matrix[embedding2_start:embedding2_end, embedding2_start:embedding2_end] = 1
+        current_idx = embedding2_end
+        
+        # Initialize model with group matrix
         model = TabNet(
             feature_dim=self.feature_dim,
-            output_dim=self.output_dim
+            output_dim=self.output_dim,
+            group_matrix=group_matrix
         )
         
         # Create mixed input features
         features = {
             'scalar1': tf.random.normal((self.batch_size,)),  # 1D scalar feature
             'scalar2': tf.random.normal((self.batch_size,)),  # 1D scalar feature
-            'embedding1': tf.random.normal((self.batch_size, 16)),  # Pre-embedded feature
-            'embedding2': tf.random.normal((self.batch_size, 32)),  # Pre-embedded feature
-            'continuous1': tf.random.normal((self.batch_size, 10)),  # Regular 2D feature
-            'continuous2': tf.random.normal((self.batch_size, 20))   # Regular 2D feature
+            'embedding1': tf.random.normal((self.batch_size, embedding1_dim)),  # Pre-embedded feature
+            'embedding2': tf.random.normal((self.batch_size, embedding2_dim)),  # Pre-embedded feature
+            'continuous1': tf.random.normal((self.batch_size, continuous1_dim)),  # Regular 2D feature
+            'continuous2': tf.random.normal((self.batch_size, continuous2_dim))   # Regular 2D feature
         }
         
         # Test in eager mode
-        output = model(features, training=True)
+        output, masks, _ = model(features, training=True)
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        
+        # Verify that embedding dimensions are masked together
+        for mask in masks:
+            # Check embedding1 mask values are identical within the group
+            embedding1_mask = mask[:, embedding1_start:embedding1_end]
+            self.assertTrue(tf.reduce_all(embedding1_mask == embedding1_mask[:, 0:1]))
+            
+            # Check embedding2 mask values are identical within the group
+            embedding2_mask = mask[:, embedding2_start:embedding2_end]
+            self.assertTrue(tf.reduce_all(embedding2_mask == embedding2_mask[:, 0:1]))
         
         # Test in graph mode
         @tf.function
         def run_model(features):
             return model(features, training=True)
             
-        output = run_model(features)
+        output, masks, _ = run_model(features)
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        
+        # Verify masks in graph mode
+        for mask in masks:
+            embedding1_mask = mask[:, embedding1_start:embedding1_end]
+            self.assertTrue(tf.reduce_all(embedding1_mask == embedding1_mask[:, 0:1]))
+            
+            embedding2_mask = mask[:, embedding2_start:embedding2_end]
+            self.assertTrue(tf.reduce_all(embedding2_mask == embedding2_mask[:, 0:1]))
         
     def test_mixed_feature_types_list(self):
         """Test TabNet with mixed feature types as list input"""
@@ -141,13 +187,14 @@ class TabNetTests(tf.test.TestCase):
         ]
         
         # Test forward pass
-        output = model(features, training=True)
+        output, _, _ = model(features, training=True)
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
         
         # Test with @tf.function
         @tf.function
         def run_model(features):
-            return model(features, training=True)
+            output, _, _ = model(features, training=True)
+            return output
             
         output = run_model(features)
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
@@ -163,7 +210,7 @@ class TabNetTests(tf.test.TestCase):
         feature = tf.random.normal((self.batch_size,))
         
         # Test forward pass
-        output = model(feature, training=True)
+        output, _, _ = model(feature, training=True)
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
 
 if __name__ == '__main__':

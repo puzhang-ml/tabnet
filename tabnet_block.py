@@ -3,47 +3,145 @@ import numpy as np
 from typing import Dict, List, Tuple
 
 class GBN(tf.keras.layers.Layer):
-    """
-    Ghost Batch Normalization
-    """
-    def __init__(self, input_dim, virtual_batch_size=128, momentum=0.01):
-        super(GBN, self).__init__()
-        self.input_dim = input_dim
+    """Ghost Batch Normalization layer."""
+    def __init__(self, feature_dim, virtual_batch_size=None, momentum=0.9, epsilon=1e-5):
+        """Initialize the layer.
+        
+        Args:
+            feature_dim: Dimension of input features
+            virtual_batch_size: Size of ghost batches
+            momentum: Momentum for moving average
+            epsilon: Small constant for numerical stability
+        """
+        super().__init__()
+        self.feature_dim = feature_dim
         self.virtual_batch_size = virtual_batch_size
-        self.bn = tf.keras.layers.BatchNormalization(momentum=momentum)
+        self.momentum = momentum
+        self.epsilon = epsilon
+        
+        # Initialize moving statistics
+        self.beta = tf.Variable(tf.zeros([feature_dim]), trainable=True)
+        self.gamma = tf.Variable(tf.ones([feature_dim]), trainable=True)
+        self.moving_mean = tf.Variable(tf.zeros([feature_dim]), trainable=False)
+        self.moving_variance = tf.Variable(tf.ones([feature_dim]), trainable=False)
+
+    def _batch_norm(self, x, training):
+        """Apply batch normalization to input tensor.
+        
+        Args:
+            x: Input tensor
+            training: Whether in training mode
+            
+        Returns:
+            Normalized tensor
+        """
+        if training:
+            mean, variance = tf.nn.moments(x, axes=[0], keepdims=True)
+            # Update moving statistics
+            self.moving_mean.assign(
+                self.momentum * self.moving_mean + (1 - self.momentum) * tf.squeeze(mean))
+            self.moving_variance.assign(
+                self.momentum * self.moving_variance + (1 - self.momentum) * tf.squeeze(variance))
+        else:
+            mean = tf.reshape(self.moving_mean, [1, -1])
+            variance = tf.reshape(self.moving_variance, [1, -1])
+            
+        x = (x - mean) / tf.sqrt(variance + self.epsilon)
+        return x * self.gamma + self.beta
         
     def call(self, x, training=None):
-        # During model building, just use regular batch normalization
-        if x.shape[0] is None:
-            return self.bn(x, training=training)
+        """Forward pass.
+        
+        Args:
+            x: Input tensor
+            training: Whether in training mode
             
-        # Get actual batch size
-        batch_size = tf.shape(x)[0]
-        
-        # If batch size is smaller than virtual_batch_size, use regular BN
-        if self.virtual_batch_size is None or batch_size <= self.virtual_batch_size:
-            return self.bn(x, training=training)
+        Returns:
+            Normalized tensor
+        """
+        if training and self.virtual_batch_size is not None:
+            # Split input into virtual batches
+            batch_size = tf.shape(x)[0]
+            split_size = self.virtual_batch_size
             
-        # Calculate number of splits and split size
-        n_splits = tf.cast(tf.math.ceil(batch_size / self.virtual_batch_size), tf.int32)
-        split_size = tf.cast(tf.math.ceil(batch_size / n_splits), tf.int32)
-        
-        # Create split sizes tensor
-        last_split_size = batch_size - split_size * (n_splits - 1)
-        split_sizes = tf.concat([
-            tf.repeat(split_size, n_splits - 1),
-            tf.expand_dims(last_split_size, 0)
-        ], axis=0)
-        
-        # Split into virtual batches
-        chunks = tf.split(x, split_sizes, axis=0)
-        normalized_chunks = [self.bn(chunk, training=training) for chunk in chunks]
-        
-        return tf.concat(normalized_chunks, axis=0)
+            if batch_size < split_size:
+                return self._batch_norm(x, training)
+                
+            # Calculate number of full virtual batches
+            n_vbs = batch_size // split_size
+            
+            # Split into virtual batches
+            vbs = tf.split(x[:n_vbs * split_size], n_vbs)
+            
+            # Handle remaining samples
+            remaining = x[n_vbs * split_size:]
+            if tf.shape(remaining)[0] > 0:
+                vbs.append(remaining)
+            
+            # Apply batch norm to each virtual batch
+            vb_outputs = []
+            for vb in vbs:
+                vb_output = self._batch_norm(vb, training)
+                vb_outputs.append(vb_output)
+                
+            # Concatenate results
+            return tf.concat(vb_outputs, axis=0)
+        else:
+            return self._batch_norm(x, training)
 
 class GLU_Block(tf.keras.layers.Layer):
+    def __init__(self, input_dim, output_dim, virtual_batch_size=None, momentum=0.02):
+        super(GLU_Block, self).__init__()
+        self.output_dim = output_dim
+        self.fc = tf.keras.layers.Dense(output_dim * 2, input_shape=(input_dim,))
+        self.bn = GBN(output_dim * 2, virtual_batch_size, momentum)
+
+    def call(self, x, training=None):
+        x = self.fc(x)
+        x = self.bn(x, training=training)
+        out = tf.multiply(x[:, :self.output_dim], tf.nn.sigmoid(x[:, self.output_dim:]))
+        return out
+
+class FeatureTransformer(tf.keras.layers.Layer):
+    def __init__(self, feature_dim, n_independent=2, n_shared=2, virtual_batch_size=None, momentum=0.02):
+        super(FeatureTransformer, self).__init__()
+        self.n_independent = n_independent
+        self.n_shared = n_shared
+        
+        # Independent layers
+        self.independent = [
+            GLU_Block(
+                feature_dim if i == 0 else feature_dim,
+                feature_dim,
+                virtual_batch_size,
+                momentum
+            ) for i in range(n_independent)
+        ]
+        
+        # Shared layers
+        self.shared = [
+            GLU_Block(
+                feature_dim if i == 0 else feature_dim,
+                feature_dim,
+                virtual_batch_size,
+                momentum
+            ) for i in range(n_shared)
+        ]
+
+    def call(self, x, training=None):
+        # Independent GLU Blocks
+        out = x
+        for layer in self.independent:
+            out = layer(out, training=training)
+            
+        # Shared GLU Blocks
+        for layer in self.shared:
+            out = layer(out, training=training)
+        return out
+
+class FeatTransformer(tf.keras.layers.Layer):
     def __init__(self, feature_dim, virtual_batch_size=None, **kwargs):
-        super(GLU_Block, self).__init__(**kwargs)
+        super(FeatTransformer, self).__init__(**kwargs)
         self.feature_dim = feature_dim
         
         # Dense layer for GLU
@@ -113,93 +211,178 @@ def sparsemax(z):
     
     return p
 
+class Sparsemax(tf.keras.layers.Layer):
+    """Sparsemax activation function layer"""
+    def __init__(self, axis=-1, **kwargs):
+        super(Sparsemax, self).__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, inputs):
+        return tf.nn.softmax(inputs, axis=self.axis)  # Using softmax for now, will implement true sparsemax later
+
+    def get_config(self):
+        config = {'axis': self.axis}
+        base_config = super(Sparsemax, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
 class AttentiveTransformer(tf.keras.layers.Layer):
-    def __init__(self, feature_dim, virtual_batch_size=None, **kwargs):
-        super(AttentiveTransformer, self).__init__(**kwargs)
+    """Attentive transformer layer for TabNet."""
+    def __init__(self, feature_dim):
+        """Initialize the layer.
+        
+        Args:
+            feature_dim: Dimension of input features
+        """
+        super().__init__()
         self.feature_dim = feature_dim
-        
-        # Dense layer for attention
-        self.fc = tf.keras.layers.Dense(feature_dim)
-        
-        # Batch normalization
-        self.bn = GBN(
-            input_dim=feature_dim,
-            virtual_batch_size=virtual_batch_size
-        )
-    
+        self.dense = tf.keras.layers.Dense(feature_dim)
+        self.gbn = GBN(feature_dim)
+        self.sparsemax = Sparsemax()
+
     def call(self, inputs, training=None):
-        x = self.fc(inputs)
-        x = self.bn(x, training=training)
-        return sparsemax(x)
+        """Forward pass.
+        
+        Args:
+            inputs: List containing [features, prior_scales]
+            training: Whether in training mode
+        
+        Returns:
+            Feature mask
+        """
+        features, prior_scales = inputs
+        batch_size = tf.shape(features)[0]
+        
+        # Transform features
+        transformed = self.dense(features)
+        transformed = self.gbn(transformed, training=training)
+        
+        # Ensure prior_scales has the same feature dimension
+        if prior_scales.shape[-1] != transformed.shape[-1]:
+            # Project prior_scales to match feature dimension
+            prior_scales = tf.expand_dims(prior_scales, -1)
+            prior_scales = tf.tile(prior_scales, [1, self.feature_dim])
+        
+        # Apply mask
+        mask = self.sparsemax(transformed * prior_scales)
+        return mask
 
 class TabNetEncoder(tf.keras.layers.Layer):
+    """TabNet encoder layer."""
     def __init__(self, feature_dim, output_dim, num_decision_steps=5,
                  relaxation_factor=1.5, sparsity_coefficient=1e-5,
-                 virtual_batch_size=None, num_groups=1, epsilon=1e-5,
-                 **kwargs):
-        super(TabNetEncoder, self).__init__(**kwargs)
+                 virtual_batch_size=None, n_independent=2, n_shared=2, momentum=0.02,
+                 group_matrix=None):
+        """Initialize the encoder.
         
+        Args:
+            feature_dim: Dimension of input features
+            output_dim: Dimension of output
+            num_decision_steps: Number of decision steps
+            relaxation_factor: Relaxation factor for feature selection
+            sparsity_coefficient: Sparsity coefficient for feature selection
+            virtual_batch_size: Virtual batch size for ghost batch normalization
+            n_independent: Number of independent GLU blocks
+            n_shared: Number of shared GLU blocks
+            momentum: Momentum for batch normalization
+            group_matrix: Matrix specifying feature grouping relationships
+        """
+        super().__init__()
         self.feature_dim = feature_dim
         self.output_dim = output_dim
         self.num_decision_steps = num_decision_steps
         self.relaxation_factor = relaxation_factor
         self.sparsity_coefficient = sparsity_coefficient
         self.virtual_batch_size = virtual_batch_size
-        self.num_groups = num_groups
-        self.epsilon = epsilon
+        self.n_independent = n_independent
+        self.n_shared = n_shared
+        self.momentum = momentum
         
-        # Feature transformer
-        self.transform = FeatTransformer(
-            feature_dim=feature_dim
-        )
-        
-        # Attentive transformers
-        self.attentive_transformers = []
-        for _ in range(num_decision_steps):
-            self.attentive_transformers.append(
-                AttentiveTransformer(
-                    feature_dim=feature_dim,
-                    virtual_batch_size=virtual_batch_size
-                )
-            )
-        
-        # Output layer
-        self.output_layer = tf.keras.layers.Dense(output_dim)
-
-    def call(self, features, training=None):
-        batch_size = tf.shape(features)[0]
-        
-        # Initialize masks
-        prior_scales = tf.ones([batch_size, self.feature_dim])
-        
-        # Transform features
-        transformed_features = self.transform(features, training=training)
-        
-        # Process each decision step
-        step_outputs = []
-        for step_idx in range(self.num_decision_steps):
-            # Get attention mask
-            mask = self.attentive_transformers[step_idx](transformed_features, training=training)
+        if group_matrix is not None:
+            self.group_matrix = tf.convert_to_tensor(group_matrix, dtype=tf.float32)
+        else:
+            self.group_matrix = None
             
-            # Update prior scales
-            prior_scales = prior_scales * (self.relaxation_factor - mask)
-            
-            # Apply mask to features
-            masked_features = transformed_features * mask
-            
-            # Get step output
-            step_output = self.output_layer(masked_features)
-            step_outputs.append(step_output)
-            
-            # Add sparsity loss
-            batch_means = tf.reduce_mean(mask, axis=0)
-            sparsity_loss = tf.reduce_mean(
-                tf.reduce_sum(batch_means * tf.math.log(batch_means + self.epsilon))
-            )
-            self.add_loss(self.sparsity_coefficient * sparsity_loss)
+        # Create layers
+        self.input_dense = tf.keras.layers.Dense(feature_dim)
+        self.output_dense = tf.keras.layers.Dense(output_dim)
         
-        # Return final step output
-        return step_outputs[-1]
+    def _process_input(self, inputs):
+        """Process input features to match feature_dim."""
+        if isinstance(inputs, dict):
+            # Process dictionary values
+            processed_inputs = []
+            for value in inputs.values():
+                if len(value.shape) == 1:
+                    value = tf.expand_dims(value, -1)
+                processed_inputs.append(value)
+            x = tf.concat(processed_inputs, axis=1)
+        elif isinstance(inputs, list):
+            # Process list of tensors
+            processed_inputs = []
+            for tensor in inputs:
+                if len(tensor.shape) == 1:
+                    tensor = tf.expand_dims(tensor, -1)
+                processed_inputs.append(tensor)
+            x = tf.concat(processed_inputs, axis=1)
+        else:
+            # Single tensor input
+            if len(inputs.shape) == 1:
+                x = tf.expand_dims(inputs, -1)
+            else:
+                x = inputs
+                
+        if x.shape[-1] != self.feature_dim:
+            x = self.input_dense(x)
+        return x
+        
+    def _compute_mask(self, prior, att):
+        """Compute feature mask.
+        
+        Args:
+            prior: Prior mask
+            att: Attention weights
+            
+        Returns:
+            Feature selection mask
+        """
+        mask = prior * att
+        if self.group_matrix is not None:
+            # Apply group relationships to mask
+            group_att = tf.matmul(mask, self.group_matrix)  # [batch_size, feature_dim]
+            # Compute group normalization factors
+            group_sums = tf.reduce_sum(self.group_matrix, axis=1)  # [feature_dim]
+            group_sums = tf.where(group_sums > 0, group_sums, tf.ones_like(group_sums))
+            # Normalize within groups
+            group_att = group_att / tf.expand_dims(group_sums + 1e-15, 0)  # [batch_size, feature_dim]
+            # Map back to feature space
+            mask = tf.matmul(group_att, tf.transpose(self.group_matrix))  # [batch_size, feature_dim]
+        # Apply softmax to get final mask
+        mask = tf.nn.softmax(mask, axis=-1)
+        return mask
+        
+    def call(self, inputs, training=None):
+        x = self._process_input(inputs)
+        # Process features and compute masks
+        masks = []
+        total_entropy = 0
+        prior = tf.ones_like(x)
+        
+        for step in range(self.num_decision_steps):
+            mask = self._compute_mask(prior, x)
+            masks.append(mask)
+            
+            # Update prior
+            prior = prior * (self.relaxation_factor - mask)
+            
+            # Compute entropy for sparsity loss
+            entropy = -tf.reduce_mean(tf.reduce_sum(mask * tf.math.log(mask + 1e-15), axis=1))
+            total_entropy += entropy
+            
+        # Compute final output
+        output = self.output_dense(x)
+        sparsity_loss = total_entropy * self.sparsity_coefficient
+        
+        return output, masks, sparsity_loss
 
 class DynamicProjection(tf.keras.layers.Layer):
     def __init__(self, feature_dim, **kwargs):
@@ -270,20 +453,26 @@ class DynamicProjection(tf.keras.layers.Layer):
         return outputs
 
 class TabNet(tf.keras.Model):
-    """
-    TabNet model implementation that handles:
-    1. Embedding features (pre-embedded tensors)
-    2. Scalar features (1D)
-    3. Regular continuous features (2D)
-    """
-    def __init__(self, feature_dim=64, output_dim=1, num_decision_steps=5,
+    """TabNet model."""
+    def __init__(self, feature_dim, output_dim, num_decision_steps=5,
                  relaxation_factor=1.5, sparsity_coefficient=1e-5,
-                 virtual_batch_size=None, num_groups=1, epsilon=1e-5):
-        super(TabNet, self).__init__()
-        self.feature_dim = feature_dim
-        self.output_dim = output_dim
+                 virtual_batch_size=None, n_independent=2, n_shared=2, momentum=0.02,
+                 group_matrix=None):
+        """Initialize TabNet model.
         
-        # TabNet encoder
+        Args:
+            feature_dim: Dimension of input features
+            output_dim: Dimension of output
+            num_decision_steps: Number of decision steps
+            relaxation_factor: Relaxation factor for feature selection
+            sparsity_coefficient: Sparsity coefficient for feature selection
+            virtual_batch_size: Virtual batch size for ghost batch normalization
+            n_independent: Number of independent GLU blocks
+            n_shared: Number of shared GLU blocks
+            momentum: Momentum for batch normalization
+            group_matrix: Matrix specifying feature grouping relationships
+        """
+        super().__init__()
         self.encoder = TabNetEncoder(
             feature_dim=feature_dim,
             output_dim=output_dim,
@@ -291,59 +480,18 @@ class TabNet(tf.keras.Model):
             relaxation_factor=relaxation_factor,
             sparsity_coefficient=sparsity_coefficient,
             virtual_batch_size=virtual_batch_size,
-            num_groups=num_groups,
-            epsilon=epsilon
+            n_independent=n_independent,
+            n_shared=n_shared,
+            momentum=momentum,
+            group_matrix=group_matrix
         )
-        
-        # Input projection layer
-        self.input_projection = DynamicProjection(feature_dim)
-    
-    def _process_input(self, inputs):
-        if isinstance(inputs, dict):
-            # Process dictionary inputs
-            processed_features = []
-            for feat_name, tensor in inputs.items():
-                # Handle scalar features (1D)
-                if len(tensor.shape) == 1:
-                    processed = tf.expand_dims(tensor, -1)
-                # Handle embedding features (already embedded) and regular features
-                else:
-                    processed = tensor
-                processed_features.append(processed)
-            # Concatenate along feature dimension
-            x_processed = tf.concat(processed_features, axis=-1)
-        elif isinstance(inputs, (list, tuple)):
-            # Process list/tuple inputs
-            processed_features = []
-            for tensor in inputs:
-                # Handle scalar features (1D)
-                if len(tensor.shape) == 1:
-                    processed = tf.expand_dims(tensor, -1)
-                # Handle embedding features (already embedded) and regular features
-                else:
-                    processed = tensor
-                processed_features.append(processed)
-            # Concatenate along feature dimension
-            x_processed = tf.concat(processed_features, axis=-1)
-        else:
-            # Single tensor input
-            if len(inputs.shape) == 1:
-                # Handle scalar input
-                x_processed = tf.expand_dims(inputs, -1)
-            else:
-                x_processed = inputs
-        
-        # Ensure input is 2D before projection
-        if len(x_processed.shape) == 1:
-            x_processed = tf.expand_dims(x_processed, -1)
-        
-        # Project to feature dimension
-        x_processed = self.input_projection(x_processed)
-        return x_processed
-    
+
     def call(self, inputs, training=None):
-        x_processed = self._process_input(inputs)
-        return self.encoder(x_processed, training=training)
+        output, masks, sparsity_loss = self.encoder(inputs, training=training)
+        if training:
+            self.add_loss(sparsity_loss)
+            return output, masks, sparsity_loss
+        return output
 
 class FeatureProcessor:
     def __init__(self, feature_config: dict):
@@ -359,4 +507,4 @@ class FeatureProcessor:
                 tensor = feature_dict[feature_name]
                 features_list.append(tensor)
         
-        return tf.concat(features_list, axis=1) 
+        return tf.concat(features_list, axis=1)
