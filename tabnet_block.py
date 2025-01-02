@@ -6,106 +6,40 @@ class GBN(tf.keras.layers.Layer):
     """
     Ghost Batch Normalization
     """
-    def __init__(self, input_dim, virtual_batch_size=None, momentum=0.9, epsilon=1e-5, **kwargs):
-        super(GBN, self).__init__(**kwargs)
+    def __init__(self, input_dim, virtual_batch_size=128, momentum=0.01):
+        super(GBN, self).__init__()
         self.input_dim = input_dim
         self.virtual_batch_size = virtual_batch_size
-        self.momentum = momentum
-        self.epsilon = epsilon
+        self.bn = tf.keras.layers.BatchNormalization(momentum=momentum)
         
-        # Initialize moving statistics
-        self.moving_mean = self.add_weight(
-            name='moving_mean',
-            shape=(input_dim,),
-            initializer='zeros',
-            trainable=False
-        )
-        self.moving_variance = self.add_weight(
-            name='moving_variance',
-            shape=(input_dim,),
-            initializer='ones',
-            trainable=False
-        )
-        
-        # Initialize batch normalization parameters
-        self.beta = self.add_weight(
-            name='beta',
-            shape=(input_dim,),
-            initializer='zeros',
-            trainable=True
-        )
-        self.gamma = self.add_weight(
-            name='gamma',
-            shape=(input_dim,),
-            initializer='ones',
-            trainable=True
-        )
-    
     def call(self, x, training=None):
-        if not training:
-            # Use moving statistics for inference
-            return tf.nn.batch_normalization(
-                x,
-                self.moving_mean,
-                self.moving_variance,
-                self.beta,
-                self.gamma,
-                self.epsilon
-            )
-        
+        # During model building, just use regular batch normalization
+        if x.shape[0] is None:
+            return self.bn(x, training=training)
+            
+        # Get actual batch size
         batch_size = tf.shape(x)[0]
         
+        # If batch size is smaller than virtual_batch_size, use regular BN
         if self.virtual_batch_size is None or batch_size <= self.virtual_batch_size:
-            # Apply regular batch normalization
-            mean, variance = tf.nn.moments(x, axes=[0], keepdims=True)
-            x_normed = tf.nn.batch_normalization(
-                x,
-                mean,
-                variance,
-                self.beta,
-                self.gamma,
-                self.epsilon
-            )
+            return self.bn(x, training=training)
             
-            # Update moving statistics
-            self.moving_mean.assign(
-                self.momentum * self.moving_mean + (1 - self.momentum) * tf.squeeze(mean)
-            )
-            self.moving_variance.assign(
-                self.momentum * self.moving_variance + (1 - self.momentum) * tf.squeeze(variance)
-            )
-            
-            return x_normed
-        else:
-            # Apply ghost batch normalization
-            splits = tf.split(x, num_or_size_splits=batch_size // self.virtual_batch_size, axis=0)
-            normalized_splits = []
-            
-            for split in splits:
-                mean, variance = tf.nn.moments(split, axes=[0], keepdims=True)
-                split_normed = tf.nn.batch_normalization(
-                    split,
-                    mean,
-                    variance,
-                    self.beta,
-                    self.gamma,
-                    self.epsilon
-                )
-                normalized_splits.append(split_normed)
-            
-            # Concatenate normalized splits
-            x_normed = tf.concat(normalized_splits, axis=0)
-            
-            # Update moving statistics using full batch statistics
-            mean, variance = tf.nn.moments(x, axes=[0], keepdims=True)
-            self.moving_mean.assign(
-                self.momentum * self.moving_mean + (1 - self.momentum) * tf.squeeze(mean)
-            )
-            self.moving_variance.assign(
-                self.momentum * self.moving_variance + (1 - self.momentum) * tf.squeeze(variance)
-            )
-            
-            return x_normed
+        # Calculate number of splits and split size
+        n_splits = tf.cast(tf.math.ceil(batch_size / self.virtual_batch_size), tf.int32)
+        split_size = tf.cast(tf.math.ceil(batch_size / n_splits), tf.int32)
+        
+        # Create split sizes tensor
+        last_split_size = batch_size - split_size * (n_splits - 1)
+        split_sizes = tf.concat([
+            tf.repeat(split_size, n_splits - 1),
+            tf.expand_dims(last_split_size, 0)
+        ], axis=0)
+        
+        # Split into virtual batches
+        chunks = tf.split(x, split_sizes, axis=0)
+        normalized_chunks = [self.bn(chunk, training=training) for chunk in chunks]
+        
+        return tf.concat(normalized_chunks, axis=0)
 
 class GLU_Block(tf.keras.layers.Layer):
     def __init__(self, feature_dim, virtual_batch_size=None, **kwargs):
