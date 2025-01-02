@@ -162,7 +162,9 @@ class TabNetEncoder(tf.keras.Model):
     def _compute_mask(self, prior, att):
         mask = prior * att
         
+        # Apply group attention if matrix is provided
         if self.group_attention_matrix is not None:
+            # Project attention to feature groups and back
             group_att = tf.matmul(mask, tf.cast(self.group_attention_matrix, mask.dtype))
             mask = tf.matmul(group_att, tf.transpose(tf.cast(self.group_attention_matrix, mask.dtype)))
             
@@ -170,59 +172,8 @@ class TabNetEncoder(tf.keras.Model):
             mask = sparsemax(mask)
         return mask
 
-def create_feature_config(feature_dict: Dict[str, tf.Tensor]) -> dict:
-    """Create feature configuration from a feature dictionary"""
-    config = {}
-    total_dims = 0
-    
-    for feature_name, tensor in feature_dict.items():
-        # Always use dynamic shape
-        feature_dims = tf.shape(tensor)[-1]
-        config[feature_name] = {
-            'start_idx': total_dims,
-            'end_idx': total_dims + feature_dims,
-            'dims': feature_dims
-        }
-        total_dims += feature_dims
-    
-    config['total_dims'] = total_dims
-    return config
-
-def create_group_matrix(feature_config: dict) -> tf.Tensor:
-    """Create group matrix where each feature is treated as one group"""
-    # Get total dimensions
-    total_dims = feature_config['total_dims']
-    n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims' key
-    
-    # Create empty matrix
-    group_matrix = tf.zeros((total_dims, n_features))
-    current_pos = 0
-    
-    # Build the matrix one feature at a time
-    for idx, (feature_name, info) in enumerate(feature_config.items()):
-        if feature_name != 'total_dims':
-            feature_dim = info['dims']
-            start_idx = info['start_idx']
-            end_idx = info['end_idx']
-            
-            # Create a mask for this feature
-            feature_mask = tf.scatter_nd(
-                indices=tf.reshape(tf.range(start_idx, end_idx), [-1, 1]),
-                updates=tf.ones(end_idx - start_idx),
-                shape=[total_dims]
-            )
-            
-            # Update the corresponding column in the group matrix
-            group_matrix = tf.tensor_scatter_nd_update(
-                group_matrix,
-                indices=tf.stack([tf.range(total_dims), tf.fill([total_dims], idx)], axis=1),
-                updates=feature_mask
-            )
-    
-    return group_matrix
-
 class TabNet(tf.keras.Model):
-    """TabNet model that handles both tensor and list inputs"""
+    """TabNet model that handles multiple features with group masking"""
     def __init__(
         self,
         feature_dim: int = 512,
@@ -238,7 +189,7 @@ class TabNet(tf.keras.Model):
         self.feature_dim = feature_dim
         self.output_dim = output_dim
         
-        # Initialize TabNet with dynamic input dimension
+        # Initialize TabNet
         self.tabnet = TabNetEncoder(
             input_dim=None,  # Will be set in call()
             output_dim=output_dim,
@@ -252,71 +203,43 @@ class TabNet(tf.keras.Model):
             momentum=momentum
         )
         
-    def create_group_matrix(self, x_processed, feature_dims):
-        """Create group attention matrix using tf.while_loop for Graph compatibility"""
-        total_dims = tf.shape(x_processed)[1]
+    @tf.function
+    def create_feature_mask(self, feature_dims, total_dims):
+        """Create mask matrix that groups feature dimensions"""
         n_features = tf.shape(feature_dims)[0]
+        cumsum = tf.concat([[0], tf.cumsum(feature_dims)], axis=0)
         
-        # Calculate cumulative sums
-        cumsum_dims = tf.concat([[0], tf.cumsum(feature_dims)], axis=0)
+        # Create mask matrix where each column represents one feature
+        mask = tf.zeros((total_dims, n_features))
         
-        # Create indices and values for sparse tensor
-        indices_ta = tf.TensorArray(tf.int32, size=n_features)
-        values_ta = tf.TensorArray(tf.float32, size=n_features)
+        # For each feature, set its dimensions to 1 in the corresponding column
+        for i in tf.range(n_features):
+            start = cumsum[i]
+            end = cumsum[i + 1]
+            mask = tf.tensor_scatter_nd_update(
+                mask,
+                tf.stack([tf.range(start, end), tf.fill([end - start], i)], axis=1),
+                tf.ones(end - start)
+            )
+        return mask
         
-        def sparse_body(feat_idx, indices_ta, values_ta):
-            start = cumsum_dims[feat_idx]
-            end = cumsum_dims[feat_idx + 1]
-            size = end - start
-            
-            # Create indices for this feature
-            row_indices = tf.range(start, end)
-            col_indices = tf.fill([size], feat_idx)
-            feature_indices = tf.stack([row_indices, col_indices], axis=1)
-            
-            # Update indices and values
-            indices_ta = indices_ta.write(feat_idx, feature_indices)
-            values_ta = values_ta.write(feat_idx, tf.ones(size))
-            
-            return feat_idx + 1, indices_ta, values_ta
-            
-        def sparse_cond(feat_idx, indices_ta, values_ta):
-            return feat_idx < n_features
-            
-        _, indices_ta, values_ta = tf.while_loop(
-            sparse_cond, 
-            sparse_body, 
-            [tf.constant(0), indices_ta, values_ta]
-        )
-        
-        # Combine all indices and values
-        indices = tf.concat(indices_ta.stack(), axis=0)
-        values = tf.concat(values_ta.stack(), axis=0)
-        
-        # Create sparse tensor
-        sparse = tf.sparse.SparseTensor(
-            indices=indices,
-            values=values,
-            dense_shape=[total_dims, n_features]
-        )
-        return tf.sparse.to_dense(sparse)
-        
-    def call(self, features, training=None):
-        if isinstance(features, (list, tuple)):
-            # Handle list of tensors
-            feature_dims = tf.stack([tf.shape(feat)[1] for feat in features])
-            x_processed = tf.concat(features, axis=1)
+    def call(self, inputs, training=None):
+        # Handle both dict and list inputs
+        if isinstance(inputs, dict):
+            features = list(inputs.values())
         else:
-            # Handle single tensor input - treat each column as a feature
-            x_processed = features
-            feature_dims = tf.ones([tf.shape(features)[1]], dtype=tf.int32)
+            features = inputs
             
+        # Concatenate features and get their dimensions
+        x_processed = tf.concat(features, axis=1)
+        feature_dims = tf.convert_to_tensor([tf.shape(f)[1] for f in features])
+        
         # Set input dimension if not set
         if self.tabnet.input_dim is None:
             self.tabnet.input_dim = tf.shape(x_processed)[1]
             
-        # Create group matrix
-        group_matrix = self.create_group_matrix(x_processed, feature_dims)
+        # Create feature mask matrix
+        group_matrix = self.create_feature_mask(feature_dims, self.tabnet.input_dim)
         self.tabnet.group_attention_matrix = group_matrix
         
         # Get predictions
