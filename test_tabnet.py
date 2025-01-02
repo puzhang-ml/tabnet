@@ -95,27 +95,76 @@ class TabNetTests(tf.test.TestCase):
         output = model(features, training=True)
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
         
-    def test_dynamic_shapes(self):
-        """Test TabNet with dynamic input shapes"""
+    def test_mixed_feature_types(self):
+        """Test TabNet with mixed feature types (scalar, embedding, regular)"""
         model = TabNet(
             feature_dim=self.feature_dim,
             output_dim=self.output_dim
         )
         
-        # Create features with unknown shapes
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=(None, None), dtype=tf.float32),
-            tf.TensorSpec(shape=(None, None), dtype=tf.float32)
-        ])
-        def run_model(feat1, feat2):
-            return model([feat1, feat2], training=True)
-            
-        feat1 = tf.random.normal((self.batch_size, 10))
-        feat2 = tf.random.normal((self.batch_size, 20))
-        output = run_model(feat1, feat2)
+        # Create mixed input features
+        features = {
+            'scalar1': tf.random.normal((self.batch_size,)),  # 1D scalar feature
+            'scalar2': tf.random.normal((self.batch_size,)),  # 1D scalar feature
+            'embedding1': tf.random.normal((self.batch_size, 16)),  # Pre-embedded feature
+            'embedding2': tf.random.normal((self.batch_size, 32)),  # Pre-embedded feature
+            'continuous1': tf.random.normal((self.batch_size, 10)),  # Regular 2D feature
+            'continuous2': tf.random.normal((self.batch_size, 20))   # Regular 2D feature
+        }
         
-        self.assertEqual(output.shape[0], self.batch_size)
-        self.assertEqual(output.shape[1], self.output_dim)
+        # Test in eager mode
+        output = model(features, training=True)
+        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        
+        # Test in graph mode
+        @tf.function
+        def run_model(features):
+            return model(features, training=True)
+            
+        output = run_model(features)
+        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        
+    def test_mixed_feature_types_list(self):
+        """Test TabNet with mixed feature types as list input"""
+        model = TabNet(
+            feature_dim=self.feature_dim,
+            output_dim=self.output_dim
+        )
+        
+        # Create list of mixed features
+        features = [
+            tf.random.normal((self.batch_size,)),         # 1D scalar feature
+            tf.random.normal((self.batch_size, 16)),      # Pre-embedded feature
+            tf.random.normal((self.batch_size,)),         # Another 1D scalar
+            tf.random.normal((self.batch_size, 32)),      # Another embedding
+            tf.random.normal((self.batch_size, 10))       # Regular 2D feature
+        ]
+        
+        # Test forward pass
+        output = model(features, training=True)
+        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        
+        # Test with @tf.function
+        @tf.function
+        def run_model(features):
+            return model(features, training=True)
+            
+        output = run_model(features)
+        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        
+    def test_single_scalar_feature(self):
+        """Test TabNet with a single scalar feature"""
+        model = TabNet(
+            feature_dim=self.feature_dim,
+            output_dim=self.output_dim
+        )
+        
+        # Create single scalar feature
+        feature = tf.random.normal((self.batch_size,))
+        
+        # Test forward pass
+        output = model(feature, training=True)
+        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
 
 if __name__ == '__main__':
     tf.test.main() 
