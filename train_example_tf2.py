@@ -11,43 +11,83 @@ from tabnet_block import TabNet
 tf.random.set_seed(42)
 np.random.seed(42)
 
-def generate_sample_data(batch_size: int = 8192) -> List[tf.Tensor]:
-    """Generate sample preprocessed data as a list of tensors.
-    Total input dimension is 900, split across 300 features (3 dims each)"""
-    features = []
-    for _ in range(300):
-        # Each feature has 3 dimensions
-        features.append(tf.random.normal((batch_size, 3)))
-    return features
-
-def create_dataset(features: List[tf.Tensor], batch_size: int) -> tf.data.Dataset:
-    """Create TensorFlow dataset from features list"""
-    # Generate random binary labels for this example
-    labels = tf.cast(tf.random.uniform((features[0].shape[0],)) > 0.5, tf.float32)
+def generate_sample_data(num_samples=256):
+    """Generate sample data for training."""
+    # Generate scalar features
+    scalar1 = tf.random.normal((num_samples,))
+    scalar2 = tf.random.normal((num_samples,))
     
-    # Convert list of features to a dictionary
-    features_dict = {f'feature_{i}': tensor for i, tensor in enumerate(features)}
+    # Generate embedding features
+    embedding1 = tf.random.normal((num_samples, 16))
+    embedding2 = tf.random.normal((num_samples, 32))
+    
+    # Generate continuous features
+    continuous1 = tf.random.normal((num_samples, 10))
+    continuous2 = tf.random.normal((num_samples, 20))
+    
+    # Create feature dictionary
+    features = {
+        'scalar1': scalar1,
+        'scalar2': scalar2,
+        'embedding1': embedding1,
+        'embedding2': embedding2,
+        'continuous1': continuous1,
+        'continuous2': continuous2
+    }
+    
+    # Calculate total feature dimension
+    total_dim = (
+        1 +  # scalar1
+        1 +  # scalar2
+        16 + # embedding1
+        32 + # embedding2
+        10 + # continuous1
+        20   # continuous2
+    )
+    
+    # Define feature groups
+    current_idx = 2  # After two scalar features
+    embedding1_start = current_idx
+    embedding1_end = embedding1_start + 16
+    embedding2_start = embedding1_end
+    embedding2_end = embedding2_start + 32
+    
+    grouped_features = [
+        list(range(embedding1_start, embedding1_end)),  # embedding1 group
+        list(range(embedding2_start, embedding2_end))   # embedding2 group
+    ]
+    
+    return features, total_dim, grouped_features
+
+def create_dataset(features: Dict[str, tf.Tensor], batch_size: int) -> tf.data.Dataset:
+    """Create TensorFlow dataset from features dictionary"""
+    # Generate random binary labels for this example
+    labels = tf.cast(tf.random.uniform((features['scalar1'].shape[0],)) > 0.5, tf.float32)
     
     # Create dataset from the dictionary and labels
-    dataset = tf.data.Dataset.from_tensor_slices((features_dict, labels))
+    dataset = tf.data.Dataset.from_tensor_slices((features, labels))
     return dataset.shuffle(buffer_size=10000).batch(batch_size)
 
 @tf.function
-def train_step(model: tf.keras.Model, 
-              optimizer: tf.keras.optimizers.Optimizer,
-              features: Dict[str, tf.Tensor], 
-              labels: tf.Tensor) -> tf.Tensor:
-    """Single training step"""
+def train_step(model, optimizer, features, labels):
+    """Single training step."""
     with tf.GradientTape() as tape:
-        # Get model outputs including masks and sparsity loss during training
-        output, masks, sparsity_loss = model(features, training=True)
-        # Binary cross-entropy loss
-        bce_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(labels, output))
-        # Total loss includes sparsity regularization
-        total_loss = bce_loss + config["sparsity_coefficient"] * sparsity_loss
+        # Forward pass
+        output, _, sparsity_loss = model(features, training=True)
         
+        # Compute BCE loss
+        bce_loss = tf.reduce_mean(
+            tf.keras.losses.binary_crossentropy(labels, output)
+        )
+        
+        # Total loss is BCE loss plus sparsity loss
+        # Note: sparsity_coefficient is already applied in the model
+        total_loss = bce_loss + sparsity_loss
+        
+    # Compute gradients and update weights
     gradients = tape.gradient(total_loss, model.trainable_variables)
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    
     return total_loss, output
 
 def evaluate_model(model: tf.keras.Model, dataset: tf.data.Dataset) -> tuple[float, float]:
@@ -72,35 +112,21 @@ def evaluate_model(model: tf.keras.Model, dataset: tf.data.Dataset) -> tuple[flo
     return avg_loss, auc
 
 def main():
-    # Configuration for large-scale TabNet
-    # Parameters adjusted for 900-dimensional input with 300 features
-    global config  # Make config accessible to train_step
+    """Main training function."""
+    print("\nGenerating sample data...")
+    features, total_dim, grouped_features = generate_sample_data()
+    
+    # Model configuration
     config = {
-        "feature_dim": 256,    # Increased feature dimension for complex data
-        "output_dim": 1,       # Binary classification
-        "num_decision_steps": 5,  # Increased steps for more complex feature interactions
+        "feature_dim": total_dim,  # Total dimension of concatenated features
+        "output_dim": 1,           # Binary classification
+        "num_decision_steps": 5,
         "relaxation_factor": 1.5,
-        "sparsity_coefficient": 1e-4,  # Adjusted for larger feature space
-        "virtual_batch_size": 512,  # Virtual batch size for ghost batch norm
-        "momentum": 0.02,      # Momentum for batch normalization
-        "epsilon": 1e-5
+        "sparsity_coefficient": 1e-5,
+        "bn_virtual_bs": 128,
+        "bn_momentum": 0.02
     }
     
-    # Training parameters
-    BATCH_SIZE = 256
-    EPOCHS = 10
-    LEARNING_RATE = 0.001
-    
-    # Generate sample data
-    print("Generating sample data...")
-    train_features = generate_sample_data(batch_size=8192)
-    test_features = generate_sample_data(batch_size=2048)
-    
-    # Create datasets
-    train_dataset = create_dataset(train_features, BATCH_SIZE)
-    test_dataset = create_dataset(test_features, BATCH_SIZE)
-    
-    # Initialize model
     print("\nInitializing TabNet model...")
     model = TabNet(
         feature_dim=config["feature_dim"],
@@ -108,37 +134,41 @@ def main():
         num_decision_steps=config["num_decision_steps"],
         relaxation_factor=config["relaxation_factor"],
         sparsity_coefficient=config["sparsity_coefficient"],
-        virtual_batch_size=config["virtual_batch_size"],
-        momentum=config["momentum"]
+        bn_virtual_bs=config["bn_virtual_bs"],
+        bn_momentum=config["bn_momentum"],
+        epsilon=1e-5,
+        grouped_features=grouped_features
     )
     
-    # Initialize optimizer
-    optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE)
+    # Create optimizer
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.02)
     
-    # Training loop
+    # Create datasets
+    train_dataset = create_dataset(features, batch_size=256)
+    test_dataset = create_dataset(features, batch_size=256)
+    
     print("\nStarting training...")
     best_auc = 0
     patience = 5
     patience_counter = 0
     
-    for epoch in range(EPOCHS):
+    for epoch in range(100):
         # Training
         epoch_loss = 0
         num_batches = 0
-        for features, labels in train_dataset:
-            loss, _ = train_step(model, optimizer, features, labels)
+        
+        for features_batch, labels_batch in train_dataset:
+            loss, _ = train_step(model, optimizer, features_batch, labels_batch)
             epoch_loss += loss
             num_batches += 1
         
-        avg_train_loss = epoch_loss / num_batches
+        avg_loss = epoch_loss / num_batches
         
         # Evaluation
         test_loss, test_auc = evaluate_model(model, test_dataset)
         
-        print(f"Epoch {epoch + 1}/{EPOCHS}:")
-        print(f"  Train Loss: {avg_train_loss:.4f}")
-        print(f"  Test Loss: {test_loss:.4f}")
-        print(f"  Test AUC: {test_auc:.4f}")
+        print(f"Epoch {epoch + 1}: Train Loss = {avg_loss:.4f}, "
+              f"Test Loss = {test_loss:.4f}, Test AUC = {test_auc:.4f}")
         
         # Early stopping
         if test_auc > best_auc:
@@ -148,15 +178,8 @@ def main():
             patience_counter += 1
             
         if patience_counter >= patience:
-            print("\nEarly stopping triggered!")
+            print(f"\nEarly stopping triggered. Best Test AUC: {best_auc:.4f}")
             break
-    
-    print(f"\nTraining completed. Best Test AUC: {best_auc:.4f}")
-    
-    # Final evaluation
-    test_loss, test_auc = evaluate_model(model, test_dataset)
-    print(f"Final Test Loss: {test_loss:.4f}")
-    print(f"Final Test AUC: {test_auc:.4f}")
 
 if __name__ == "__main__":
     main()

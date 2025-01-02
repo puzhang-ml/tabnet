@@ -107,27 +107,23 @@ class TabNetTests(tf.test.TestCase):
         continuous2_dim = 20
         total_dims = scalar_dim * 2 + embedding1_dim + embedding2_dim + continuous1_dim + continuous2_dim
         
-        # Create group matrix for embeddings
-        group_matrix = np.zeros((self.feature_dim, self.feature_dim))
+        # Define feature groups for embeddings
         current_idx = 2  # After two scalar features
-        
-        # Group embedding1 dimensions
         embedding1_start = current_idx
         embedding1_end = embedding1_start + embedding1_dim
-        group_matrix[embedding1_start:embedding1_end, embedding1_start:embedding1_end] = 1
-        current_idx = embedding1_end
-        
-        # Group embedding2 dimensions
-        embedding2_start = current_idx
+        embedding2_start = embedding1_end
         embedding2_end = embedding2_start + embedding2_dim
-        group_matrix[embedding2_start:embedding2_end, embedding2_start:embedding2_end] = 1
-        current_idx = embedding2_end
         
-        # Initialize model with group matrix
+        grouped_features = [
+            list(range(embedding1_start, embedding1_end)),  # embedding1 group
+            list(range(embedding2_start, embedding2_end))   # embedding2 group
+        ]
+        
+        # Initialize model with grouped features
         model = TabNet(
-            feature_dim=self.feature_dim,
+            feature_dim=total_dims,
             output_dim=self.output_dim,
-            group_matrix=group_matrix
+            grouped_features=grouped_features
         )
         
         # Create mixed input features
@@ -148,11 +144,19 @@ class TabNetTests(tf.test.TestCase):
         for mask in masks:
             # Check embedding1 mask values are identical within the group
             embedding1_mask = mask[:, embedding1_start:embedding1_end]
-            self.assertTrue(tf.reduce_all(embedding1_mask == embedding1_mask[:, 0:1]))
+            self.assertAllClose(
+                embedding1_mask,
+                tf.tile(embedding1_mask[:, :1], [1, embedding1_dim]),
+                rtol=1e-5
+            )
             
             # Check embedding2 mask values are identical within the group
             embedding2_mask = mask[:, embedding2_start:embedding2_end]
-            self.assertTrue(tf.reduce_all(embedding2_mask == embedding2_mask[:, 0:1]))
+            self.assertAllClose(
+                embedding2_mask,
+                tf.tile(embedding2_mask[:, :1], [1, embedding2_dim]),
+                rtol=1e-5
+            )
         
         # Test in graph mode
         @tf.function
