@@ -193,33 +193,42 @@ def create_group_matrix(feature_config: dict) -> tf.Tensor:
     total_dims = feature_config['total_dims']
     n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims' key
     
-    # Create empty sparse tensor indices and values
-    indices = []
-    values = []
+    # Initialize sparse tensor components
+    all_indices = []
+    all_values = []
+    running_idx = 0
     
-    # Build indices and values for sparse tensor
+    # Process each feature in chunks to avoid large tensor creation
     for idx, (feature_name, info) in enumerate(feature_config.items()):
         if feature_name != 'total_dims':
             start_idx = info['start_idx']
             end_idx = info['end_idx']
-            size = end_idx - start_idx
+            feature_dim = end_idx - start_idx
             
-            # Create row indices
-            row_indices = tf.range(start_idx, end_idx, dtype=tf.int32)
-            # Create column indices (all same value)
-            col_indices = tf.fill([size], idx)
+            # Process in chunks of 1000 elements
+            chunk_size = 1000
+            num_chunks = (feature_dim + chunk_size - 1) // chunk_size
             
-            # Stack row and column indices
-            feature_indices = tf.stack([row_indices, col_indices], axis=1)
-            
-            indices.append(feature_indices)
-            values.append(tf.ones(size, dtype=tf.float32))
+            for chunk in range(num_chunks):
+                chunk_start = start_idx + chunk * chunk_size
+                chunk_end = min(start_idx + (chunk + 1) * chunk_size, end_idx)
+                chunk_size_actual = chunk_end - chunk_start
+                
+                # Create indices for this chunk
+                chunk_indices = tf.stack([
+                    tf.range(chunk_start, chunk_end, dtype=tf.int32),
+                    tf.fill([chunk_size_actual], idx)
+                ], axis=1)
+                
+                all_indices.append(chunk_indices)
+                all_values.append(tf.ones(chunk_size_actual, dtype=tf.float32))
+                running_idx += chunk_size_actual
     
-    # Concatenate all indices and values
-    indices = tf.concat(indices, axis=0)
-    values = tf.concat(values, axis=0)
+    # Combine all chunks
+    indices = tf.concat(all_indices, axis=0)
+    values = tf.concat(all_values, axis=0)
     
-    # Create sparse tensor and convert to dense
+    # Create sparse tensor
     sparse = tf.sparse.SparseTensor(
         indices=indices,
         values=values,
