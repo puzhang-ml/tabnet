@@ -193,49 +193,31 @@ def create_group_matrix(feature_config: dict) -> tf.Tensor:
     total_dims = feature_config['total_dims']
     n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims' key
     
-    # Initialize sparse tensor components
-    all_indices = []
-    all_values = []
-    running_idx = 0
+    # Create empty matrix
+    group_matrix = tf.zeros((total_dims, n_features))
     
-    # Process each feature in chunks to avoid large tensor creation
+    # Process each feature
     for idx, (feature_name, info) in enumerate(feature_config.items()):
         if feature_name != 'total_dims':
             start_idx = info['start_idx']
             end_idx = info['end_idx']
-            feature_dim = end_idx - start_idx
             
-            # Process in chunks of 1000 elements
-            chunk_size = 1000
-            num_chunks = (feature_dim + chunk_size - 1) // chunk_size
+            # Create a range mask for this feature
+            row_indices = tf.range(total_dims, dtype=tf.int32)
+            mask = tf.logical_and(
+                tf.greater_equal(row_indices, start_idx),
+                tf.less(row_indices, end_idx)
+            )
             
-            for chunk in range(num_chunks):
-                chunk_start = start_idx + chunk * chunk_size
-                chunk_end = min(start_idx + (chunk + 1) * chunk_size, end_idx)
-                chunk_size_actual = chunk_end - chunk_start
-                
-                # Create indices for this chunk
-                chunk_indices = tf.stack([
-                    tf.range(chunk_start, chunk_end, dtype=tf.int32),
-                    tf.fill([chunk_size_actual], idx)
-                ], axis=1)
-                
-                all_indices.append(chunk_indices)
-                all_values.append(tf.ones(chunk_size_actual, dtype=tf.float32))
-                running_idx += chunk_size_actual
+            # Update the group matrix for this feature
+            updates = tf.cast(mask, tf.float32)
+            group_matrix = tf.tensor_scatter_nd_update(
+                group_matrix,
+                tf.expand_dims(row_indices, 1),
+                tf.expand_dims(updates, 1)[:, idx:idx+1]
+            )
     
-    # Combine all chunks
-    indices = tf.concat(all_indices, axis=0)
-    values = tf.concat(all_values, axis=0)
-    
-    # Create sparse tensor
-    sparse = tf.sparse.SparseTensor(
-        indices=indices,
-        values=values,
-        dense_shape=[total_dims, n_features]
-    )
-    
-    return tf.sparse.to_dense(sparse)
+    return group_matrix
 
 class TabNet(tf.keras.Model):
     """TabNet model that handles dictionary inputs and preprocessor outputs"""
