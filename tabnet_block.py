@@ -190,33 +190,35 @@ def create_feature_config(feature_dict: Dict[str, tf.Tensor]) -> dict:
 
 def create_group_matrix(feature_config: dict) -> tf.Tensor:
     """Create group matrix where each feature is treated as one group"""
-    total_dims = feature_config['total_dims']
+    # Create a static group matrix at initialization time
+    total_dims = 0
     n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims' key
+    group_matrix = []
     
-    # Create empty matrix
-    group_matrix = tf.zeros((total_dims, n_features))
-    
-    # Process each feature
-    for idx, (feature_name, info) in enumerate(feature_config.items()):
+    # Build the matrix column by column (one column per feature)
+    for feat_idx, (feature_name, info) in enumerate(feature_config.items()):
         if feature_name != 'total_dims':
-            start_idx = info['start_idx']
-            end_idx = info['end_idx']
+            # Get feature dimension (should be a concrete value)
+            feature_dim = info['dims']
+            if isinstance(feature_dim, tf.Tensor):
+                feature_dim = tf.get_static_value(feature_dim)
+            if feature_dim is None:
+                raise ValueError(f"Feature {feature_name} has unknown dimension at initialization")
             
-            # Create indices for this feature's rows
-            indices = tf.range(start_idx, end_idx)
-            indices = tf.stack([indices, tf.fill(tf.shape(indices), idx)], axis=1)
-            
-            # Create updates (ones for this feature's rows)
-            updates = tf.ones(end_idx - start_idx)
-            
-            # Update the group matrix
-            group_matrix = tf.tensor_scatter_nd_update(
-                group_matrix,
-                indices,
-                updates
-            )
+            # Create column for this feature
+            column = np.zeros(total_dims)  # Zeros for previous features
+            column = np.append(column, np.ones(feature_dim))  # Ones for this feature
+            total_dims += feature_dim
+            group_matrix.append(column)
     
-    return group_matrix
+    # Pad remaining dimensions with zeros
+    for col in group_matrix:
+        if len(col) < total_dims:
+            col = np.append(col, np.zeros(total_dims - len(col)))
+    
+    # Convert to tensor
+    group_matrix = np.stack(group_matrix, axis=1)
+    return tf.constant(group_matrix, dtype=tf.float32)
 
 class TabNet(tf.keras.Model):
     """TabNet model that handles dictionary inputs and preprocessor outputs"""
