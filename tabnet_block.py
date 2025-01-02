@@ -193,29 +193,40 @@ def create_group_matrix(feature_config: dict) -> tf.Tensor:
     total_dims = feature_config['total_dims']
     n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims' key
     
-    # Create group matrix using tf.zeros
-    group_matrix = tf.zeros((total_dims, n_features))
+    # Create empty sparse tensor indices and values
+    indices = []
+    values = []
     
+    # Build indices and values for sparse tensor
     for idx, (feature_name, info) in enumerate(feature_config.items()):
         if feature_name != 'total_dims':
             start_idx = info['start_idx']
             end_idx = info['end_idx']
+            size = end_idx - start_idx
             
-            # Create indices for this feature group
-            indices = []
-            for i in tf.range(start_idx, end_idx):
-                indices.append(tf.stack([i, tf.cast(idx, tf.int32)]))
+            # Create row indices
+            row_indices = tf.range(start_idx, end_idx, dtype=tf.int32)
+            # Create column indices (all same value)
+            col_indices = tf.fill([size], idx)
             
-            # Update group matrix
-            indices = tf.stack(indices)
-            updates = tf.ones(end_idx - start_idx)
-            group_matrix = tf.tensor_scatter_nd_update(
-                group_matrix,
-                indices,
-                updates
-            )
+            # Stack row and column indices
+            feature_indices = tf.stack([row_indices, col_indices], axis=1)
             
-    return group_matrix
+            indices.append(feature_indices)
+            values.append(tf.ones(size, dtype=tf.float32))
+    
+    # Concatenate all indices and values
+    indices = tf.concat(indices, axis=0)
+    values = tf.concat(values, axis=0)
+    
+    # Create sparse tensor and convert to dense
+    sparse = tf.sparse.SparseTensor(
+        indices=indices,
+        values=values,
+        dense_shape=[total_dims, n_features]
+    )
+    
+    return tf.sparse.to_dense(sparse)
 
 class TabNet(tf.keras.Model):
     """TabNet model that handles dictionary inputs and preprocessor outputs"""
