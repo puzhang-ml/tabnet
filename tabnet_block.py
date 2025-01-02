@@ -239,9 +239,7 @@ class TabNet(tf.keras.Model):
         self.feature_config = feature_config
         self.feature_processor = FeatureProcessor(feature_config)
         
-        # Create group matrix from feature config
-        group_matrix = create_group_matrix(feature_config)
-        
+        # Initialize TabNet without group matrix
         self.tabnet = TabNetEncoder(
             input_dim=feature_config['total_dims'],
             output_dim=output_dim,
@@ -253,12 +251,45 @@ class TabNet(tf.keras.Model):
             n_shared=n_shared,
             virtual_batch_size=virtual_batch_size,
             momentum=momentum,
-            group_attention_matrix=group_matrix
+            group_attention_matrix=None  # We'll handle this in call()
         )
+        
+        # Store feature info for group matrix creation
+        self.n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims'
+        
+    def build(self, input_shape):
+        # Create group matrix once actual dimensions are known
+        self.group_matrix = self.add_weight(
+            name='group_matrix',
+            shape=(self.feature_config['total_dims'], self.n_features),
+            initializer=self.create_group_matrix_initializer(),
+            trainable=False
+        )
+        super().build(input_shape)
+    
+    def create_group_matrix_initializer(self):
+        def initializer(shape, dtype=None):
+            matrix = tf.zeros(shape)
+            for idx, (feature_name, info) in enumerate(self.feature_config.items()):
+                if feature_name != 'total_dims':
+                    start_idx = info['start_idx']
+                    end_idx = info['end_idx']
+                    matrix = matrix + tf.scatter_nd(
+                        indices=[[i, idx] for i in range(start_idx, end_idx)],
+                        updates=tf.ones(end_idx - start_idx),
+                        shape=shape
+                    )
+            return matrix
+        return initializer
         
     def call(self, inputs: Dict[str, tf.Tensor], training=None):
         # Process dictionary input into tensor
         x_processed = self.feature_processor.process_features(inputs)
+        
+        # Update TabNet's group matrix
+        self.tabnet.group_attention_matrix = self.group_matrix
+        
+        # Get predictions
         steps_output, M_loss = self.tabnet(x_processed, training=training)
         return steps_output[-1]  # Return last step output
 
