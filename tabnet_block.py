@@ -222,10 +222,9 @@ def create_group_matrix(feature_config: dict) -> tf.Tensor:
     return group_matrix
 
 class TabNet(tf.keras.Model):
-    """TabNet model that handles dictionary inputs and preprocessor outputs"""
+    """TabNet model that handles list of feature tensors"""
     def __init__(
         self,
-        feature_config: dict,
         feature_dim: int = 512,
         output_dim: int = 64,
         n_steps: int = 1,
@@ -236,12 +235,12 @@ class TabNet(tf.keras.Model):
         n_shared: int = 2,
     ):
         super(TabNet, self).__init__()
-        self.feature_config = feature_config
-        self.feature_processor = FeatureProcessor(feature_config)
+        self.feature_dim = feature_dim
+        self.output_dim = output_dim
         
-        # Initialize TabNet without group matrix
+        # Initialize TabNet with dynamic input dimension
         self.tabnet = TabNetEncoder(
-            input_dim=feature_config['total_dims'],
+            input_dim=None,  # Will be set in call()
             output_dim=output_dim,
             n_d=feature_dim,
             n_a=feature_dim,
@@ -250,48 +249,42 @@ class TabNet(tf.keras.Model):
             n_independent=n_independent,
             n_shared=n_shared,
             virtual_batch_size=virtual_batch_size,
-            momentum=momentum,
-            group_attention_matrix=None  # We'll handle this in call()
+            momentum=momentum
         )
         
-        # Store feature info for group matrix creation
-        self.n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims'
+    def call(self, features: List[tf.Tensor], training=None):
+        # Concatenate features
+        x_processed = tf.concat(features, axis=1)
         
-    def build(self, input_shape):
-        # Create group matrix once actual dimensions are known
-        self.group_matrix = self.add_weight(
-            name='group_matrix',
-            shape=(self.feature_config['total_dims'], self.n_features),
-            initializer=self.create_group_matrix_initializer(),
-            trainable=False
+        # Get cumulative dimensions for group matrix
+        n_features = len(features)
+        feature_dims = [tf.shape(feat)[1] for feat in features]
+        cumsum_dims = tf.cumsum(tf.stack([0] + feature_dims))
+        
+        # Set input dimension if not set
+        if self.tabnet.input_dim is None:
+            self.tabnet.input_dim = tf.shape(x_processed)[1]
+        
+        # Create group matrix efficiently
+        indices = tf.concat([
+            tf.stack([
+                tf.range(start, end),
+                tf.fill([end - start], i)
+            ], axis=1)
+            for i, (start, end) in enumerate(zip(cumsum_dims[:-1], cumsum_dims[1:]))
+        ], axis=0)
+        
+        values = tf.ones(tf.shape(indices)[0])
+        group_matrix = tf.sparse.SparseTensor(
+            indices=indices,
+            values=values,
+            dense_shape=[self.tabnet.input_dim, n_features]
         )
-        super().build(input_shape)
-    
-    def create_group_matrix_initializer(self):
-        def initializer(shape, dtype=None):
-            matrix = tf.zeros(shape)
-            for idx, (feature_name, info) in enumerate(self.feature_config.items()):
-                if feature_name != 'total_dims':
-                    start_idx = info['start_idx']
-                    end_idx = info['end_idx']
-                    matrix = matrix + tf.scatter_nd(
-                        indices=[[i, idx] for i in range(start_idx, end_idx)],
-                        updates=tf.ones(end_idx - start_idx),
-                        shape=shape
-                    )
-            return matrix
-        return initializer
-        
-    def call(self, inputs: Dict[str, tf.Tensor], training=None):
-        # Process dictionary input into tensor
-        x_processed = self.feature_processor.process_features(inputs)
-        
-        # Update TabNet's group matrix
-        self.tabnet.group_attention_matrix = self.group_matrix
+        self.tabnet.group_attention_matrix = tf.sparse.to_dense(group_matrix)
         
         # Get predictions
         steps_output, M_loss = self.tabnet(x_processed, training=training)
-        return steps_output[-1]  # Return last step output
+        return steps_output[-1]
 
 class FeatureProcessor:
     def __init__(self, feature_config: dict):
