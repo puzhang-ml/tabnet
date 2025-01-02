@@ -312,25 +312,42 @@ class TabNetEncoder(tf.keras.layers.Layer):
             # Process dictionary values
             processed_inputs = []
             for value in inputs.values():
+                # Handle scalar inputs
                 if len(value.shape) == 1:
                     value = tf.expand_dims(value, -1)
+                # Handle 2D inputs
+                elif len(value.shape) == 2:
+                    value = tf.cast(value, tf.float32)
+                else:
+                    raise ValueError(f"Input tensor has unsupported shape: {value.shape}")
                 processed_inputs.append(value)
+            # Concatenate along feature dimension
             x = tf.concat(processed_inputs, axis=1)
         elif isinstance(inputs, list):
             # Process list of tensors
             processed_inputs = []
             for tensor in inputs:
+                # Handle scalar inputs
                 if len(tensor.shape) == 1:
                     tensor = tf.expand_dims(tensor, -1)
+                # Handle 2D inputs
+                elif len(tensor.shape) == 2:
+                    tensor = tf.cast(tensor, tf.float32)
+                else:
+                    raise ValueError(f"Input tensor has unsupported shape: {tensor.shape}")
                 processed_inputs.append(tensor)
+            # Concatenate along feature dimension
             x = tf.concat(processed_inputs, axis=1)
         else:
             # Single tensor input
             if len(inputs.shape) == 1:
                 x = tf.expand_dims(inputs, -1)
+            elif len(inputs.shape) == 2:
+                x = tf.cast(inputs, tf.float32)
             else:
-                x = inputs
+                raise ValueError(f"Input tensor has unsupported shape: {inputs.shape}")
                 
+        # Project to feature_dim if needed
         if x.shape[-1] != self.feature_dim:
             x = self.input_dense(x)
         return x
