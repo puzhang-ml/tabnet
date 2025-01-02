@@ -193,19 +193,25 @@ def create_group_matrix(feature_config: dict) -> tf.Tensor:
     total_dims = feature_config['total_dims']
     n_features = len(feature_config) - 1  # Subtract 1 for 'total_dims' key
     
-    # Convert to tf.Tensor instead of numpy array
+    # Create group matrix using tf.zeros
     group_matrix = tf.zeros((total_dims, n_features))
     
     for idx, (feature_name, info) in enumerate(feature_config.items()):
         if feature_name != 'total_dims':
             start_idx = info['start_idx']
             end_idx = info['end_idx']
-            # Use tensor operations instead of numpy
-            indices = tf.range(start_idx, end_idx)
+            
+            # Create indices for this feature group
+            indices = []
+            for i in tf.range(start_idx, end_idx):
+                indices.append(tf.stack([i, tf.cast(idx, tf.int32)]))
+            
+            # Update group matrix
+            indices = tf.stack(indices)
             updates = tf.ones(end_idx - start_idx)
             group_matrix = tf.tensor_scatter_nd_update(
                 group_matrix,
-                tf.stack([indices, tf.fill(indices.shape, idx)], axis=1),
+                indices,
                 updates
             )
             
