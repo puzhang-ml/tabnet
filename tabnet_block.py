@@ -252,35 +252,86 @@ class TabNet(tf.keras.Model):
             momentum=momentum
         )
         
-    def call(self, features: List[tf.Tensor], training=None):
-        # Concatenate features
-        x_processed = tf.concat(features, axis=1)
+    def create_group_matrix(self, features, total_dims, n_features):
+        """Create group attention matrix using tf.while_loop for Graph compatibility"""
+        # Initialize cumsum dims with first feature
+        i = tf.constant(0)
+        cumsum = tf.TensorArray(tf.int32, size=n_features + 1)
+        cumsum = cumsum.write(0, tf.constant(0))
         
-        # Get cumulative dimensions for group matrix
-        n_features = len(features)
-        feature_dims = [tf.shape(feat)[1] for feat in features]
-        cumsum_dims = tf.cumsum(tf.stack([0] + feature_dims))
+        # Calculate cumulative dimensions
+        def body(i, cumsum):
+            feat_dim = tf.shape(features[i])[1]
+            cumsum = cumsum.write(i + 1, cumsum.read(i) + feat_dim)
+            return i + 1, cumsum
+            
+        def cond(i, cumsum):
+            return i < n_features
+            
+        _, cumsum = tf.while_loop(cond, body, [i, cumsum])
+        cumsum_dims = cumsum.stack()
         
+        # Create indices and values for sparse tensor
+        indices_ta = tf.TensorArray(tf.int32, size=0, dynamic_size=True)
+        values_ta = tf.TensorArray(tf.float32, size=0, dynamic_size=True)
+        current_idx = tf.constant(0)
+        
+        def sparse_body(feat_idx, current_idx, indices_ta, values_ta):
+            start = cumsum_dims[feat_idx]
+            end = cumsum_dims[feat_idx + 1]
+            size = end - start
+            
+            # Create indices for this feature
+            row_indices = tf.range(start, end)
+            col_indices = tf.fill([size], feat_idx)
+            feature_indices = tf.stack([row_indices, col_indices], axis=1)
+            
+            # Update indices and values
+            indices_ta = indices_ta.write(feat_idx, feature_indices)
+            values_ta = values_ta.write(feat_idx, tf.ones(size))
+            
+            return feat_idx + 1, current_idx + size, indices_ta, values_ta
+            
+        def sparse_cond(feat_idx, current_idx, indices_ta, values_ta):
+            return feat_idx < n_features
+            
+        _, _, indices_ta, values_ta = tf.while_loop(
+            sparse_cond, 
+            sparse_body, 
+            [tf.constant(0), tf.constant(0), indices_ta, values_ta]
+        )
+        
+        # Combine all indices and values
+        indices = tf.concat(indices_ta.stack(), axis=0)
+        values = tf.concat(values_ta.stack(), axis=0)
+        
+        # Create sparse tensor
+        sparse = tf.sparse.SparseTensor(
+            indices=indices,
+            values=values,
+            dense_shape=[total_dims, n_features]
+        )
+        return tf.sparse.to_dense(sparse)
+        
+    def call(self, features, training=None):
+        if isinstance(features, (list, tuple)):
+            # Handle list of tensors
+            x_processed = tf.concat(features, axis=1)
+            n_features = len(features)
+        else:
+            # Handle single tensor input
+            x_processed = features
+            n_features = 1
+            features = [features]
+            
         # Set input dimension if not set
         if self.tabnet.input_dim is None:
             self.tabnet.input_dim = tf.shape(x_processed)[1]
-        
-        # Create group matrix efficiently
-        indices = tf.concat([
-            tf.stack([
-                tf.range(start, end),
-                tf.fill([end - start], i)
-            ], axis=1)
-            for i, (start, end) in enumerate(zip(cumsum_dims[:-1], cumsum_dims[1:]))
-        ], axis=0)
-        
-        values = tf.ones(tf.shape(indices)[0])
-        group_matrix = tf.sparse.SparseTensor(
-            indices=indices,
-            values=values,
-            dense_shape=[self.tabnet.input_dim, n_features]
-        )
-        self.tabnet.group_attention_matrix = tf.sparse.to_dense(group_matrix)
+            
+        # Create group matrix
+        total_dims = tf.shape(x_processed)[1]
+        group_matrix = self.create_group_matrix(features, total_dims, n_features)
+        self.tabnet.group_attention_matrix = group_matrix
         
         # Get predictions
         steps_output, M_loss = self.tabnet(x_processed, training=training)
