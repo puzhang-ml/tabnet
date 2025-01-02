@@ -202,19 +202,18 @@ def create_group_matrix(feature_config: dict) -> tf.Tensor:
             start_idx = info['start_idx']
             end_idx = info['end_idx']
             
-            # Create a range mask for this feature
-            row_indices = tf.range(total_dims, dtype=tf.int32)
-            mask = tf.logical_and(
-                tf.greater_equal(row_indices, start_idx),
-                tf.less(row_indices, end_idx)
-            )
+            # Create indices for this feature's rows
+            indices = tf.range(start_idx, end_idx)
+            indices = tf.stack([indices, tf.fill(tf.shape(indices), idx)], axis=1)
             
-            # Update the group matrix for this feature
-            updates = tf.cast(mask, tf.float32)
+            # Create updates (ones for this feature's rows)
+            updates = tf.ones(end_idx - start_idx)
+            
+            # Update the group matrix
             group_matrix = tf.tensor_scatter_nd_update(
                 group_matrix,
-                tf.expand_dims(row_indices, 1),
-                tf.expand_dims(updates, 1)[:, idx:idx+1]
+                indices,
+                updates
             )
     
     return group_matrix
