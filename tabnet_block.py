@@ -1,3 +1,33 @@
+"""
+Modified from the original TabNet implementation by DreamQuark:
+https://github.com/dreamquark-ai/tabnet
+
+This implementation adapts the PyTorch version to TensorFlow and includes
+modifications for dynamic feature grouping and attention mechanisms.
+
+MIT License
+
+Copyright (c) 2019 DreamQuark
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
 import tensorflow as tf
 import numpy as np
 from typing import Dict, List, Tuple
@@ -286,43 +316,37 @@ class FeatTransformer(tf.keras.layers.Layer):
         x = self.bn(x, training=training)
         return tf.nn.glu(x)
 
-def sparsemax(logits, axis=-1):
-    """Compute sparsemax activation function.
+def sparsemax(logits):
+    """Sparsemax activation function.
     
     Args:
         logits: Input tensor.
-        axis: Dimension along which to apply sparsemax.
         
     Returns:
-        Output tensor with same shape as input.
+        Output tensor after applying sparsemax.
     """
     # Sort logits in descending order
-    sorted_logits = tf.sort(logits, axis=axis, direction='DESCENDING')
+    sorted_logits = tf.sort(logits, direction='DESCENDING', axis=-1)
     
-    # Compute cumulative sum
-    cum_sum = tf.cumsum(sorted_logits, axis=axis)
+    # Calculate cumulative sums
+    cum_sums = tf.cumsum(sorted_logits, axis=-1)
     
-    # Compute range indices
-    range_indices = tf.range(1, tf.shape(logits)[axis] + 1, dtype=logits.dtype)
-    range_indices = tf.expand_dims(range_indices, 0)
+    # Calculate position where sum - 1 crosses sorted logits
+    k = tf.range(1, tf.shape(logits)[-1] + 1, dtype=logits.dtype)
+    sorted_logits_threshold = sorted_logits - (cum_sums - 1) / k
     
-    # Compute threshold
-    threshold = (cum_sum - 1) / tf.cast(range_indices, logits.dtype)
-    
-    # Find maximum index where logits > threshold
-    max_index = tf.reduce_sum(
-        tf.cast(sorted_logits > threshold, tf.int32),
-        axis=axis,
+    # Find number of elements to keep
+    max_k = tf.reduce_sum(
+        tf.cast(sorted_logits_threshold > 0, tf.int32),
+        axis=-1,
         keepdims=True
     )
     
-    # Compute tau (threshold at max_index)
-    tau = tf.gather(threshold, max_index - 1, axis=axis, batch_dims=0)
+    # Calculate threshold
+    threshold = tf.gather(sorted_logits_threshold, max_k - 1, batch_dims=1)
     
-    # Compute sparse probabilities
-    sparse_probs = tf.maximum(logits - tau, 0)
-    
-    return sparse_probs
+    # Apply threshold to get sparsemax
+    return tf.maximum(logits - threshold, 0.0)
 
 class Sparsemax(tf.keras.layers.Layer):
     """Sparsemax activation function layer"""
@@ -409,32 +433,28 @@ class TabNetEncoder(tf.keras.layers.Layer):
         n_d=8,
         n_a=8,
         n_steps=3,
-        n_independent=2,
-        n_shared=2,
-        virtual_batch_size=128,
-        momentum=0.02,
-        mask_type="sparsemax",
         gamma=1.3,
-        epsilon=1e-15,
-        feature_groups=None,
+        epsilon=1e-5,
+        momentum=0.7,
+        virtual_batch_size=None,
+        grouped_features=None,
+        mask_type="sparsemax",
         **kwargs
     ):
         """TabNet encoder.
-
+        
         Args:
             feature_dim: Number of input features.
             output_dim: Number of output dimensions.
-            n_d: Dimension of the prediction layer (usually between 4 and 64).
-            n_a: Dimension of the attention layer (usually between 4 and 64).
-            n_steps: Number of successive steps in the network (usually between 3 and 10).
-            n_independent: Number of independent GLU layer in each GLU block.
-            n_shared: Number of shared GLU layer in each GLU block.
-            virtual_batch_size: Batch size for Ghost Batch Normalization.
-            momentum: Momentum for Ghost Batch Normalization.
-            mask_type: Type of mask to use in the feature selection step.
-            gamma: Float above 1, scaling factor for attention.
+            n_d: Width of the decision prediction layer.
+            n_a: Width of the attention embedding for each mask.
+            n_steps: Number of successive steps in the network.
+            gamma: Coefficient for feature reusage in masks.
             epsilon: Small constant to avoid numerical instability.
-            feature_groups: List of list of ints, groups of features that share attention.
+            momentum: Momentum for batch normalization.
+            virtual_batch_size: Virtual batch size for ghost batch normalization.
+            grouped_features: List of list of ints, groups of features that share attention.
+            mask_type: Type of mask to use.
         """
         super().__init__(**kwargs)
         self.feature_dim = feature_dim
@@ -442,56 +462,37 @@ class TabNetEncoder(tf.keras.layers.Layer):
         self.n_d = n_d
         self.n_a = n_a
         self.n_steps = n_steps
-        self.n_independent = n_independent
-        self.n_shared = n_shared
-        self.virtual_batch_size = virtual_batch_size
-        self.mask_type = mask_type
-        self.momentum = momentum
         self.gamma = gamma
         self.epsilon = epsilon
-        self.feature_groups = feature_groups
+        self.momentum = momentum
+        self.grouped_features = grouped_features
+        self.virtual_batch_size = virtual_batch_size
+        self.mask_type = mask_type
 
-        if self.feature_groups is not None:
-            # Validate feature groups
-            used_features = set()
-            for group in self.feature_groups:
-                # Convert to set for O(1) lookup
-                group_set = set(group)
-                # Check for duplicates within group
-                if len(group_set) != len(group):
-                    raise ValueError("Duplicate features found within a group")
-                # Check for overlaps between groups
-                if used_features & group_set:
-                    raise ValueError("Feature groups must not overlap")
-                used_features.update(group_set)
-                # Check feature indices are valid
-                if max(group) >= feature_dim or min(group) < 0:
-                    raise ValueError(f"Feature indices must be between 0 and {feature_dim-1}")
-
+        # Initialize layers
         self.initial_bn = tf.keras.layers.BatchNormalization(
             momentum=self.momentum,
-            virtual_batch_size=self.virtual_batch_size
+            epsilon=self.epsilon
         )
 
+        # Initialize encoder steps
         self.encoder_steps = []
-        for step_idx in range(n_steps):
+        for _ in range(n_steps):
             self.encoder_steps.append(
-                EncoderStep(
-                    n_d=n_d,
-                    n_a=n_a,
-                    n_independent=n_independent,
-                    n_shared=n_shared,
-                    virtual_batch_size=virtual_batch_size,
-                    momentum=momentum
+                FeatureTransformer(
+                    feature_dim=feature_dim,
+                    output_dim=n_d + n_a,
+                    momentum=momentum,
+                    epsilon=epsilon
                 )
             )
 
+        # Create feature transformer
         self.feature_transformer = FeatureTransformer(
-            n_d + n_a,
-            n_independent,
-            n_shared,
-            virtual_batch_size,
-            momentum
+            feature_dim=feature_dim,
+            output_dim=n_d + n_a,
+            momentum=momentum,
+            epsilon=epsilon
         )
 
     def _compute_mask(self, features, prior_scales=None):
@@ -516,12 +517,14 @@ class TabNetEncoder(tf.keras.layers.Layer):
 
         # Compute mask
         mask = tf.keras.activations.relu(transformed)
-        mask = mask / (tf.reduce_sum(mask, axis=1, keepdims=True) + self.epsilon)
         
         # Apply feature grouping if specified
-        if self.feature_groups is not None:
-            # For each group, compute the mean mask value and apply it to all features in the group
-            for group in self.feature_groups:
+        if self.grouped_features is not None:
+            # Create a new mask tensor with same shape
+            grouped_mask = tf.zeros_like(mask)
+            
+            # For each group, compute the mean mask value
+            for group in self.grouped_features:
                 # Convert group indices to tensor
                 group_indices = tf.constant(group)
                 
@@ -531,28 +534,19 @@ class TabNetEncoder(tf.keras.layers.Layer):
                 # Compute mean mask value for the group
                 mean_mask = tf.reduce_mean(group_mask, axis=1, keepdims=True)
                 
-                # Create updates tensor by repeating mean mask for each index in the group
-                updates = tf.repeat(mean_mask, len(group), axis=1)
-                
-                # Create scatter indices
-                batch_size = tf.shape(mask)[0]
-                batch_indices = tf.range(batch_size)
-                batch_indices = tf.reshape(batch_indices, [-1, 1])
-                batch_indices = tf.tile(batch_indices, [1, len(group)])
-                batch_indices = tf.reshape(batch_indices, [-1])
-                
-                feature_indices = tf.constant(group, dtype=tf.int32)
-                feature_indices = tf.tile(feature_indices, [batch_size])
-                
-                # Combine indices
-                indices = tf.stack([batch_indices, feature_indices], axis=1)
-                
-                # Update mask using scatter_nd
-                updates_flat = tf.reshape(updates, [-1, tf.shape(mask)[-1]])
-                mask = tf.tensor_scatter_nd_update(mask, indices, updates_flat)
+                # Scatter mean mask back to all features in the group
+                for idx in group:
+                    grouped_mask = tf.tensor_scatter_nd_update(
+                        grouped_mask,
+                        tf.constant([[i, idx] for i in range(tf.shape(mask)[0])]),
+                        tf.reshape(mean_mask, [-1])
+                    )
             
-            # Normalize the mask again after group updates
-            mask = mask / (tf.reduce_sum(mask, axis=1, keepdims=True) + self.epsilon)
+            # Use grouped mask instead of original
+            mask = grouped_mask
+
+        # Normalize mask
+        mask = mask / (tf.reduce_sum(mask, axis=1, keepdims=True) + self.epsilon)
         
         # Apply sparsemax or entmax
         if self.mask_type == "sparsemax":
@@ -572,11 +566,11 @@ class TabNetEncoder(tf.keras.layers.Layer):
         """Forward pass.
 
         Args:
-            features: Input features.
+            features: Input features (dict, list, or tensor).
             training: Whether in training mode.
 
         Returns:
-            Encoded features and attention masks.
+            Tuple of (output, attention_masks, encoded_features).
         """
         bs = tf.shape(features)[0]
         
@@ -613,17 +607,11 @@ class TabNetEncoder(tf.keras.layers.Layer):
         config.update({
             'feature_dim': self.feature_dim,
             'output_dim': self.output_dim,
-            'n_d': self.n_d,
-            'n_a': self.n_a,
             'n_steps': self.n_steps,
-            'n_independent': self.n_independent,
-            'n_shared': self.n_shared,
-            'virtual_batch_size': self.virtual_batch_size,
-            'mask_type': self.mask_type,
-            'momentum': self.momentum,
             'gamma': self.gamma,
             'epsilon': self.epsilon,
-            'feature_groups': self.feature_groups
+            'momentum': self.momentum,
+            'grouped_features': self.grouped_features
         })
         return config
 
@@ -700,87 +688,107 @@ def infer_feature_groups_from_dict(inputs: Dict[str, tf.Tensor]) -> List[List[in
     
     Args:
         inputs: Dictionary of input tensors where keys indicate feature type
-               (e.g. 'embedding_1', 'numeric_1')
+               (e.g. 'embedding_1', 'numeric_1', 'categorical_1')
                
     Returns:
-        List of feature index groups
+        List of feature index groups where features with same prefix are grouped together
+        
+    Example:
+        inputs = {
+            'embedding_1': tensor(batch_size, 16),
+            'embedding_2': tensor(batch_size, 16),
+            'numeric_1': tensor(batch_size, 1),
+            'numeric_2': tensor(batch_size, 1),
+            'categorical_1': tensor(batch_size, 8)
+        }
+        
+        Returns: [
+            [0, 1, ..., 31],  # embedding features (32 total)
+            [32, 33],         # numeric features (2 total)
+            [34, ..., 41]     # categorical features (8 total)
+        ]
     """
     current_idx = 0
     prefix_to_indices = {}
     
-    for key, tensor in inputs.items():
-        # Handle both TensorShape and Tensor objects
+    # Sort keys to ensure consistent ordering
+    for key in sorted(inputs.keys()):
+        tensor = inputs[key]
+        
+        # Get feature dimension
         if isinstance(tensor, tf.TensorShape):
             feature_dim = tensor[-1]
         else:
             feature_dim = tensor.shape[-1]
             
         # Get prefix (e.g. 'embedding' from 'embedding_1')
-        prefix = key.split('_')[0]
+        prefix = key.split('_')[0].lower()
         
         if prefix not in prefix_to_indices:
             prefix_to_indices[prefix] = []
             
         # Add all indices for this feature
-        prefix_to_indices[prefix].extend(
-            list(range(current_idx, current_idx + feature_dim))
-        )
+        feature_indices = list(range(current_idx, current_idx + feature_dim))
+        prefix_to_indices[prefix].extend(feature_indices)
         current_idx += feature_dim
     
     # Only return groups with multiple features
     return [indices for indices in prefix_to_indices.values() if len(indices) > 1]
 
 class TabNet(tf.keras.Model):
-    """TabNet model."""
-
     def __init__(
         self,
-        feature_dim,
-        output_dim,
-        num_decision_steps=5,
-        relaxation_factor=1.5,
-        bn_epsilon=1e-5,
-        bn_momentum=0.7,
-        feature_groups=None,
+        feature_dim=None,  # Made optional since we can infer from dict
+        output_dim=1,
+        n_d=8,
+        n_a=8,
+        n_steps=3,
+        gamma=1.3,
+        epsilon=1e-5,
+        momentum=0.7,
+        grouped_features=None,
         **kwargs
     ):
         """Initialize TabNet model.
-
+        
         Args:
-            feature_dim: The dimension of the input features.
+            feature_dim: Optional total dimension of features. If None, will be inferred from first input.
             output_dim: The dimension of the output features.
-            num_decision_steps: Number of decision steps.
-            relaxation_factor: Relaxation factor for feature selection.
-            bn_epsilon: Batch normalization epsilon.
-            bn_momentum: Batch normalization momentum.
-            feature_groups: Optional list of feature groups.
-            **kwargs: Additional model arguments.
+            n_d: Width of the decision prediction layer.
+            n_a: Width of the attention embedding for each mask.
+            n_steps: Number of steps in the network.
+            gamma: Coefficient for feature reusage in masks.
+            epsilon: Small constant for numerical stability.
+            momentum: Momentum for batch normalization.
+            grouped_features: Optional list of feature groups.
         """
-        # Remove feature_groups from kwargs before passing to super
-        if 'feature_groups' in kwargs:
-            feature_groups = kwargs.pop('feature_groups')
         super().__init__(**kwargs)
-
+        
         self.feature_dim = feature_dim
         self.output_dim = output_dim
-        self.feature_groups = feature_groups
-
-        # Initialize encoder
-        self.encoder = TabNetEncoder(
-            feature_dim=feature_dim,
-            output_dim=feature_dim,  # Encoder maintains feature dimension
-            num_decision_steps=num_decision_steps,
-            relaxation_factor=relaxation_factor,
-            bn_epsilon=bn_epsilon,
-            bn_momentum=bn_momentum,
-            feature_groups=feature_groups
-        )
-
+        self.n_d = n_d
+        self.n_a = n_a
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.momentum = momentum
+        self.grouped_features = grouped_features
+        self.encoder = None  # Will be initialized on first call
+        
         # Initialize output layer
         self.output_layer = tf.keras.layers.Dense(
             output_dim,
             kernel_initializer=tf.keras.initializers.GlorotUniform()
         )
+
+    def _infer_feature_dim(self, features):
+        """Infer total feature dimension from input features."""
+        if isinstance(features, dict):
+            return sum(tensor.shape[-1] for tensor in features.values())
+        elif isinstance(features, (list, tuple)):
+            return sum(tensor.shape[-1] for tensor in features)
+        else:
+            return features.shape[-1]
 
     def _preprocess_features(self, features):
         """Preprocess input features.
@@ -794,7 +802,8 @@ class TabNet(tf.keras.Model):
         if isinstance(features, dict):
             # Process dictionary inputs
             processed_features = []
-            for feature in features.values():
+            for key in sorted(features.keys()):  # Sort keys for consistent ordering
+                feature = features[key]
                 if len(tf.shape(feature)) == 1:
                     feature = tf.expand_dims(feature, -1)
                 processed_features.append(feature)
@@ -813,36 +822,69 @@ class TabNet(tf.keras.Model):
 
         return features
 
+    def _initialize_encoder(self, feature_dim):
+        """Initialize encoder with correct feature dimension."""
+        self.encoder = TabNetEncoder(
+            feature_dim=feature_dim,
+            output_dim=feature_dim,
+            n_d=self.n_d,
+            n_a=self.n_a,
+            n_steps=self.n_steps,
+            gamma=self.gamma,
+            epsilon=self.epsilon,
+            momentum=self.momentum,
+            grouped_features=self.grouped_features
+        )
+
     def call(self, features, training=None):
         """Forward pass.
 
         Args:
-            features: Input features.
+            features: Input features (dict, list, or tensor).
             training: Whether in training mode.
 
         Returns:
             Tuple of (output, attention_masks, encoded_features).
         """
         # Infer feature groups from dictionary input if not provided
-        if isinstance(features, dict) and self.feature_groups is None:
-            self.feature_groups = infer_feature_groups_from_dict(features)
-            # Update encoder's feature groups
-            self.encoder.feature_groups = self.feature_groups
-
+        if isinstance(features, dict) and self.grouped_features is None:
+            self.grouped_features = infer_feature_groups_from_dict(features)
+        
         # Preprocess features
-        features = self._preprocess_features(features)
+        processed_features = self._preprocess_features(features)
+        
+        # Initialize encoder if not done yet or if feature_dim changed
+        current_feature_dim = processed_features.shape[-1]
+        if self.encoder is None or (self.feature_dim is not None and current_feature_dim != self.feature_dim):
+            self.feature_dim = current_feature_dim
+            self._initialize_encoder(current_feature_dim)
+            # Update encoder's grouped_features
+            if self.grouped_features is not None:
+                self.encoder.grouped_features = self.grouped_features
 
         # Encode features
-        encoded_features, attention_masks = self.encoder(features, training=training)
-
-        # Reshape encoded features to [batch_size, feature_dim]
-        batch_size = tf.shape(encoded_features)[0]
-        encoded_features = tf.reshape(encoded_features, [batch_size, -1])
+        encoded_features, attention_masks = self.encoder(processed_features, training=training)
 
         # Generate output
         output = self.output_layer(encoded_features)
 
         return output, attention_masks, encoded_features
+
+    def get_config(self):
+        """Get model configuration."""
+        config = super().get_config()
+        config.update({
+            'feature_dim': self.feature_dim,
+            'output_dim': self.output_dim,
+            'n_d': self.n_d,
+            'n_a': self.n_a,
+            'n_steps': self.n_steps,
+            'gamma': self.gamma,
+            'epsilon': self.epsilon,
+            'momentum': self.momentum,
+            'grouped_features': self.grouped_features
+        })
+        return config
 
 class FeatureProcessor:
     def __init__(self, feature_config: dict):

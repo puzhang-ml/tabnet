@@ -1,29 +1,56 @@
+"""
+Modified from the original TabNet implementation by DreamQuark:
+https://github.com/dreamquark-ai/tabnet
+
+MIT License
+
+Copyright (c) 2019 DreamQuark
+"""
+
 import tensorflow as tf
 import numpy as np
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score
-from typing import List, Dict
-import json
+from typing import Dict, Tuple
 
 from tabnet_block import TabNet
 
-# Set random seeds
-tf.random.set_seed(42)
-np.random.seed(42)
-
-def generate_sample_data(num_samples=256):
-    """Generate sample data with meaningful patterns."""
-    # Create correlated features with clear grouping structure
+def generate_sample_data(num_samples: int = 1000) -> Tuple[Dict[str, tf.Tensor], tf.Tensor]:
+    """Generate synthetic data with clear feature group patterns.
+    
+    Args:
+        num_samples: Number of samples to generate.
+        
+    Returns:
+        Tuple of (features_dict, labels) where features are grouped by type.
+    """
+    # Generate base features that will influence both embeddings and numerics
     base = tf.random.normal((num_samples, 4))
     
     # Create features with clear prefix grouping
     features = {
-        'embedding_1': tf.concat([base[:, :2], tf.random.normal((num_samples, 14))], axis=1),  # 16 dims
-        'embedding_2': tf.concat([base[:, 2:], tf.random.normal((num_samples, 14))], axis=1),  # 16 dims
-        'numeric_1': 0.3 * base[:, 0:1] + 0.7 * tf.random.normal((num_samples, 1)),  # 1 dim
-        'numeric_2': 0.3 * base[:, 1:2] + 0.7 * tf.random.normal((num_samples, 1)),  # 1 dim
-        'categorical_1': tf.concat([0.3 * base[:, :2], tf.random.normal((num_samples, 6))], axis=1),  # 8 dims
-        'categorical_2': tf.concat([0.3 * base[:, 2:], tf.random.normal((num_samples, 6))], axis=1)   # 8 dims
+        # Embedding features (should be grouped together)
+        'embedding_1': tf.concat([
+            base[:, :2],
+            tf.random.normal((num_samples, 14))
+        ], axis=1),  # 16 dims
+        'embedding_2': tf.concat([
+            base[:, 2:],
+            tf.random.normal((num_samples, 14))
+        ], axis=1),  # 16 dims
+        
+        # Numeric features (should be grouped together)
+        'numeric_1': 0.3 * base[:, 0:1] + 0.7 * tf.random.normal((num_samples, 1)),
+        'numeric_2': 0.3 * base[:, 1:2] + 0.7 * tf.random.normal((num_samples, 1)),
+        
+        # Categorical features (should be grouped together)
+        'categorical_1': tf.concat([
+            0.3 * base[:, :2],
+            tf.random.normal((num_samples, 6))
+        ], axis=1),  # 8 dims
+        'categorical_2': tf.concat([
+            0.3 * base[:, 2:],
+            tf.random.normal((num_samples, 6))
+        ], axis=1)   # 8 dims
     }
     
     # Generate labels based on a combination of features
@@ -33,26 +60,50 @@ def generate_sample_data(num_samples=256):
         0.2 * tf.squeeze(features['numeric_1']) +
         0.1 * tf.reduce_sum(features['categorical_1'][:, :2], axis=1)
     )
-    probs = tf.nn.sigmoid(logits)
-    labels = tf.cast(probs > 0.5, tf.float32)
+    
+    # Convert to binary labels
+    labels = tf.cast(tf.nn.sigmoid(logits) > 0.5, tf.float32)
     
     return features, labels
 
-def create_dataset(features, labels, batch_size):
-    """Create TensorFlow dataset from features dictionary and labels."""
+def create_dataset(features: Dict[str, tf.Tensor], 
+                  labels: tf.Tensor, 
+                  batch_size: int,
+                  shuffle: bool = True) -> tf.data.Dataset:
+    """Create TensorFlow dataset from features dictionary and labels.
+    
+    Args:
+        features: Dictionary of input features.
+        labels: Target labels.
+        batch_size: Batch size for training.
+        shuffle: Whether to shuffle the dataset.
+        
+    Returns:
+        TensorFlow dataset.
+    """
     dataset = tf.data.Dataset.from_tensor_slices((features, labels))
-    return dataset.shuffle(buffer_size=10000).batch(batch_size)
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=10000)
+    return dataset.batch(batch_size)
 
 def main():
-    # Parameters
-    BATCH_SIZE = 1024
-    EPOCHS = 50
-    N_SAMPLES = 10000
-    LEARNING_RATE = 0.01
+    # Set random seeds for reproducibility
+    tf.random.set_seed(42)
+    np.random.seed(42)
     
-    print("Generating data...")
-    train_features, train_labels = generate_sample_data(N_SAMPLES)
-    valid_features, valid_labels = generate_sample_data(N_SAMPLES // 5)
+    # Training parameters
+    BATCH_SIZE = 256
+    EPOCHS = 50
+    N_TRAIN = 10000
+    N_VALID = 2000
+    LEARNING_RATE = 0.02
+    EARLY_STOPPING_PATIENCE = 10
+    
+    print("Generating training data...")
+    train_features, train_labels = generate_sample_data(N_TRAIN)
+    
+    print("Generating validation data...")
+    valid_features, valid_labels = generate_sample_data(N_VALID)
     
     # Create datasets
     train_dataset = create_dataset(train_features, train_labels, BATCH_SIZE)
@@ -60,59 +111,56 @@ def main():
     
     # Calculate total feature dimension
     total_dims = sum(tensor.shape[-1] for tensor in train_features.values())
+    print(f"\nTotal feature dimensions: {total_dims}")
     
-    # Initialize model without explicit grouped_features
-    # The model will infer groups automatically from feature names
+    # Initialize model
+    # Feature groups will be automatically inferred from dictionary keys
     print("\nInitializing TabNet model...")
     model = TabNet(
-        feature_dim=total_dims,
+        feature_dim=total_dims,  # Will be used for validation
         output_dim=1,
-        n_d=8,
-        n_a=8,
-        n_steps=3,
-        gamma=1.3,
+        n_d=8,  # Width of the decision prediction layer
+        n_a=8,  # Width of the attention embedding
+        n_steps=3,  # Number of decision steps
+        gamma=1.3,  # Feature reusage coefficient
         epsilon=1e-5,
         momentum=0.7
     )
     
     # Initialize optimizer with learning rate schedule
-    initial_learning_rate = LEARNING_RATE
-    decay_steps = 1000
-    decay_rate = 0.9
-    
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate,
-        decay_steps=decay_steps,
-        decay_rate=decay_rate,
+        initial_learning_rate=LEARNING_RATE,
+        decay_steps=1000,
+        decay_rate=0.9,
         staircase=True
     )
-    
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     
     # Training loop
     print("\nStarting training...")
     best_valid_auc = 0
-    patience = 10
     patience_counter = 0
     
     for epoch in range(EPOCHS):
         # Training
         train_loss = 0
         train_batches = 0
+        
         for x_batch, y_batch in train_dataset:
             with tf.GradientTape() as tape:
-                # First forward pass will trigger automatic feature grouping
-                outputs = model(x_batch, training=True)
-                y_pred = outputs[0] if isinstance(outputs, tuple) else outputs
+                # Forward pass (first pass will trigger automatic feature grouping)
+                y_pred, masks, _ = model(x_batch, training=True)
                 y_pred = tf.squeeze(y_pred)
                 
                 # Calculate loss
-                bce_loss = tf.reduce_mean(
-                    tf.keras.losses.binary_crossentropy(y_batch, y_pred)
+                loss = tf.reduce_mean(
+                    tf.keras.losses.binary_crossentropy(
+                        y_batch,
+                        tf.nn.sigmoid(y_pred)
+                    )
                 )
-                sparsity_loss = outputs[2] if isinstance(outputs, tuple) else 0.0
-                loss = bce_loss + sparsity_loss
             
+            # Backpropagation
             gradients = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
             
@@ -124,10 +172,10 @@ def main():
         # Validation
         valid_preds = []
         valid_labels_list = []
+        
         for x_batch, y_batch in valid_dataset:
-            outputs = model(x_batch, training=False)
-            y_pred = outputs[0] if isinstance(outputs, tuple) else outputs
-            y_pred = tf.squeeze(y_pred)
+            y_pred, _, _ = model(x_batch, training=False)
+            y_pred = tf.nn.sigmoid(tf.squeeze(y_pred))
             valid_preds.extend(y_pred.numpy())
             valid_labels_list.extend(y_batch.numpy())
         
@@ -135,10 +183,11 @@ def main():
         valid_labels_list = np.array(valid_labels_list)
         valid_auc = roc_auc_score(valid_labels_list, valid_preds)
         
-        print(f"Epoch {epoch + 1}/{EPOCHS}")
+        # Print metrics
+        print(f"\nEpoch {epoch + 1}/{EPOCHS}")
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Valid AUC: {valid_auc:.4f}")
-        print(f"Learning Rate: {lr_schedule(optimizer.iterations).numpy():.6f}")
+        print(f"Learning Rate: {optimizer.learning_rate.numpy():.6f}")
         
         # Early stopping
         if valid_auc > best_valid_auc:
@@ -146,7 +195,7 @@ def main():
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= patience:
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
                 print("\nEarly stopping triggered!")
                 break
     
