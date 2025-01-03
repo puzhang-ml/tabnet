@@ -12,174 +12,147 @@ tf.random.set_seed(42)
 np.random.seed(42)
 
 def generate_sample_data(num_samples=256):
-    """Generate sample data for training."""
-    # Generate scalar features
-    scalar1 = tf.random.normal((num_samples,))
-    scalar2 = tf.random.normal((num_samples,))
-    
-    # Generate embedding features
-    embedding1 = tf.random.normal((num_samples, 16))
-    embedding2 = tf.random.normal((num_samples, 32))
-    
-    # Generate continuous features
-    continuous1 = tf.random.normal((num_samples, 10))
-    continuous2 = tf.random.normal((num_samples, 20))
-    
-    # Create feature dictionary
+    """Generate sample data with meaningful patterns."""
+    # Create correlated features
+    base = tf.random.normal((num_samples, 4))
     features = {
-        'scalar1': scalar1,
-        'scalar2': scalar2,
-        'embedding1': embedding1,
-        'embedding2': embedding2,
-        'continuous1': continuous1,
-        'continuous2': continuous2
+        'embedding_1': tf.concat([base[:, :2], tf.random.normal((num_samples, 14))], axis=1),
+        'embedding_2': tf.concat([base[:, 2:], tf.random.normal((num_samples, 14))], axis=1),
+        'numeric_1': 0.3 * base[:, 0:1] + 0.7 * tf.random.normal((num_samples, 1)),
+        'numeric_2': 0.3 * base[:, 1:2] + 0.7 * tf.random.normal((num_samples, 1)),
+        'categorical_1': tf.concat([0.3 * base[:, :2], tf.random.normal((num_samples, 6))], axis=1),
+        'categorical_2': tf.concat([0.3 * base[:, 2:], tf.random.normal((num_samples, 6))], axis=1)
     }
     
-    # Calculate total feature dimension
-    total_dim = (
-        1 +  # scalar1
-        1 +  # scalar2
-        16 + # embedding1
-        32 + # embedding2
-        10 + # continuous1
-        20   # continuous2
+    # Generate labels based on a combination of features
+    logits = (
+        0.5 * tf.reduce_sum(features['embedding_1'][:, :2], axis=1) +
+        0.3 * tf.reduce_sum(features['embedding_2'][:, :2], axis=1) +
+        0.2 * tf.squeeze(features['numeric_1']) +
+        0.1 * tf.reduce_sum(features['categorical_1'][:, :2], axis=1)
     )
+    probs = tf.nn.sigmoid(logits)
+    labels = tf.cast(probs > 0.5, tf.float32)
     
-    # Define feature groups
-    current_idx = 2  # After two scalar features
-    embedding1_start = current_idx
-    embedding1_end = embedding1_start + 16
-    embedding2_start = embedding1_end
-    embedding2_end = embedding2_start + 32
-    
-    grouped_features = [
-        list(range(embedding1_start, embedding1_end)),  # embedding1 group
-        list(range(embedding2_start, embedding2_end))   # embedding2 group
-    ]
-    
-    return features, total_dim, grouped_features
+    return features, labels
 
-def create_dataset(features: Dict[str, tf.Tensor], batch_size: int) -> tf.data.Dataset:
-    """Create TensorFlow dataset from features dictionary"""
-    # Generate random binary labels for this example
-    labels = tf.cast(tf.random.uniform((features['scalar1'].shape[0],)) > 0.5, tf.float32)
-    
-    # Create dataset from the dictionary and labels
+def create_dataset(features, labels, batch_size):
+    """Create TensorFlow dataset from features dictionary and labels."""
     dataset = tf.data.Dataset.from_tensor_slices((features, labels))
     return dataset.shuffle(buffer_size=10000).batch(batch_size)
 
-@tf.function
-def train_step(model, optimizer, features, labels):
-    """Single training step."""
-    with tf.GradientTape() as tape:
-        # Forward pass
-        output, _, sparsity_loss = model(features, training=True)
-        
-        # Compute BCE loss
-        bce_loss = tf.reduce_mean(
-            tf.keras.losses.binary_crossentropy(labels, output)
-        )
-        
-        # Total loss is BCE loss plus sparsity loss
-        # Note: sparsity_coefficient is already applied in the model
-        total_loss = bce_loss + sparsity_loss
-        
-    # Compute gradients and update weights
-    gradients = tape.gradient(total_loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-    
-    return total_loss, output
-
-def evaluate_model(model: tf.keras.Model, dataset: tf.data.Dataset) -> tuple[float, float]:
-    """Evaluate model on dataset"""
-    all_labels = []
-    all_preds = []
-    total_loss = 0
-    num_batches = 0
-    
-    for features, labels in dataset:
-        # During evaluation, only get the output predictions
-        predictions = model(features, training=False)
-        loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(labels, predictions))
-        
-        all_labels.extend(labels.numpy())
-        all_preds.extend(predictions.numpy())
-        total_loss += loss.numpy()
-        num_batches += 1
-        
-    avg_loss = total_loss / num_batches
-    auc = roc_auc_score(all_labels, all_preds)
-    return avg_loss, auc
-
 def main():
-    """Main training function."""
-    print("\nGenerating sample data...")
-    features, total_dim, grouped_features = generate_sample_data()
+    # Parameters
+    BATCH_SIZE = 1024
+    EPOCHS = 50
+    N_SAMPLES = 10000
+    LEARNING_RATE = 0.01
     
-    # Model configuration
-    config = {
-        "feature_dim": total_dim,  # Total dimension of concatenated features
-        "output_dim": 1,           # Binary classification
-        "num_decision_steps": 5,
-        "relaxation_factor": 1.5,
-        "sparsity_coefficient": 1e-5,
-        "bn_virtual_bs": 128,
-        "bn_momentum": 0.02
-    }
+    print("Generating data...")
+    train_features, train_labels = generate_sample_data(N_SAMPLES)
+    valid_features, valid_labels = generate_sample_data(N_SAMPLES // 5)
     
+    # Create datasets
+    train_dataset = create_dataset(train_features, train_labels, BATCH_SIZE)
+    valid_dataset = create_dataset(valid_features, valid_labels, BATCH_SIZE)
+    
+    # Define feature groups using indices
+    # embedding_1: 0-15, embedding_2: 16-31
+    # numeric_1: 32, numeric_2: 33
+    # categorical_1: 34-41, categorical_2: 42-49
+    grouped_features = [
+        list(range(0, 32)),  # embeddings
+        [32, 33],  # numeric
+        list(range(34, 50))  # categorical
+    ]
+    
+    # Initialize model
     print("\nInitializing TabNet model...")
     model = TabNet(
-        feature_dim=config["feature_dim"],
-        output_dim=config["output_dim"],
-        num_decision_steps=config["num_decision_steps"],
-        relaxation_factor=config["relaxation_factor"],
-        sparsity_coefficient=config["sparsity_coefficient"],
-        bn_virtual_bs=config["bn_virtual_bs"],
-        bn_momentum=config["bn_momentum"],
-        epsilon=1e-5,
+        output_dim=1,
+        num_decision_steps=5,
+        feature_dim=64,  # Increased feature dimension
+        relaxation_factor=1.5,
+        sparsity_coefficient=1e-4,  # Increased sparsity
+        bn_momentum=0.9,
         grouped_features=grouped_features
     )
     
-    # Create optimizer
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.02)
+    # Initialize optimizer with learning rate schedule
+    initial_learning_rate = LEARNING_RATE
+    decay_steps = 1000
+    decay_rate = 0.9
     
-    # Create datasets
-    train_dataset = create_dataset(features, batch_size=256)
-    test_dataset = create_dataset(features, batch_size=256)
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate,
+        decay_steps=decay_steps,
+        decay_rate=decay_rate,
+        staircase=True
+    )
     
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    
+    # Training loop
     print("\nStarting training...")
-    best_auc = 0
-    patience = 5
+    best_valid_auc = 0
+    patience = 10
     patience_counter = 0
     
-    for epoch in range(100):
+    for epoch in range(EPOCHS):
         # Training
-        epoch_loss = 0
-        num_batches = 0
+        train_loss = 0
+        train_batches = 0
+        for x_batch, y_batch in train_dataset:
+            with tf.GradientTape() as tape:
+                outputs = model(x_batch, training=True)
+                y_pred = outputs[0] if isinstance(outputs, tuple) else outputs
+                y_pred = tf.squeeze(y_pred)
+                
+                # Calculate loss
+                bce_loss = tf.reduce_mean(
+                    tf.keras.losses.binary_crossentropy(y_batch, y_pred)
+                )
+                sparsity_loss = outputs[2] if isinstance(outputs, tuple) else 0.0
+                loss = bce_loss + sparsity_loss
+            
+            gradients = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+            
+            train_loss += loss.numpy()
+            train_batches += 1
         
-        for features_batch, labels_batch in train_dataset:
-            loss, _ = train_step(model, optimizer, features_batch, labels_batch)
-            epoch_loss += loss
-            num_batches += 1
+        train_loss /= train_batches
         
-        avg_loss = epoch_loss / num_batches
+        # Validation
+        valid_preds = []
+        valid_labels_list = []
+        for x_batch, y_batch in valid_dataset:
+            outputs = model(x_batch, training=False)
+            y_pred = outputs[0] if isinstance(outputs, tuple) else outputs
+            y_pred = tf.squeeze(y_pred)
+            valid_preds.extend(y_pred.numpy())
+            valid_labels_list.extend(y_batch.numpy())
         
-        # Evaluation
-        test_loss, test_auc = evaluate_model(model, test_dataset)
+        valid_preds = np.array(valid_preds)
+        valid_labels_list = np.array(valid_labels_list)
+        valid_auc = roc_auc_score(valid_labels_list, valid_preds)
         
-        print(f"Epoch {epoch + 1}: Train Loss = {avg_loss:.4f}, "
-              f"Test Loss = {test_loss:.4f}, Test AUC = {test_auc:.4f}")
+        print(f"Epoch {epoch + 1}/{EPOCHS}")
+        print(f"Train Loss: {train_loss:.4f}")
+        print(f"Valid AUC: {valid_auc:.4f}")
+        print(f"Learning Rate: {lr_schedule(optimizer.iterations).numpy():.6f}")
         
         # Early stopping
-        if test_auc > best_auc:
-            best_auc = test_auc
+        if valid_auc > best_valid_auc:
+            best_valid_auc = valid_auc
             patience_counter = 0
         else:
             patience_counter += 1
-            
-        if patience_counter >= patience:
-            print(f"\nEarly stopping triggered. Best Test AUC: {best_auc:.4f}")
-            break
+            if patience_counter >= patience:
+                print("\nEarly stopping triggered!")
+                break
+    
+    print(f"\nTraining finished! Best validation AUC: {best_valid_auc:.4f}")
 
 if __name__ == "__main__":
     main()

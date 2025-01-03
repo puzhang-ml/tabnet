@@ -69,13 +69,14 @@ class TabNetTests(tf.test.TestCase):
         
     def test_single_tensor_input(self):
         """Test TabNet with single tensor input"""
+        input_dim = 60
         model = TabNet(
-            feature_dim=self.feature_dim,
+            feature_dim=input_dim,
             output_dim=self.output_dim
         )
         
         # Create single tensor input
-        features = tf.random.normal((self.batch_size, 60))
+        features = tf.random.normal((self.batch_size, input_dim))
         output, _, _ = model(features, training=True)
         
         # Check output shape
@@ -89,8 +90,9 @@ class TabNetTests(tf.test.TestCase):
             tf.random.normal((self.batch_size, 50))    # Normal dim feature
         ]
         
+        total_dims = sum(f.shape[-1] for f in features)
         model = TabNet(
-            feature_dim=self.feature_dim,
+            feature_dim=total_dims,
             output_dim=self.output_dim
         )
         
@@ -114,16 +116,16 @@ class TabNetTests(tf.test.TestCase):
         embedding2_start = embedding1_end
         embedding2_end = embedding2_start + embedding2_dim
         
-        grouped_features = [
+        feature_groups = [
             list(range(embedding1_start, embedding1_end)),  # embedding1 group
             list(range(embedding2_start, embedding2_end))   # embedding2 group
         ]
         
-        # Initialize model with grouped features
+        # Initialize model with feature groups
         model = TabNet(
             feature_dim=total_dims,
             output_dim=self.output_dim,
-            grouped_features=grouped_features
+            feature_groups=feature_groups
         )
         
         # Create mixed input features
@@ -143,20 +145,16 @@ class TabNetTests(tf.test.TestCase):
         # Verify that embedding dimensions are masked together
         for mask in masks:
             # Check embedding1 mask values are identical within the group
-            embedding1_mask = mask[:, embedding1_start:embedding1_end]
-            self.assertAllClose(
-                embedding1_mask,
-                tf.tile(embedding1_mask[:, :1], [1, embedding1_dim]),
-                rtol=1e-5
-            )
+            embedding1_mask = mask[:, embedding1_start:embedding1_end, :]
+            first_mask = embedding1_mask[:, :1, :]
+            repeated_mask = tf.repeat(first_mask, embedding1_dim, axis=1)
+            self.assertAllClose(embedding1_mask, repeated_mask, rtol=1e-5)
             
             # Check embedding2 mask values are identical within the group
-            embedding2_mask = mask[:, embedding2_start:embedding2_end]
-            self.assertAllClose(
-                embedding2_mask,
-                tf.tile(embedding2_mask[:, :1], [1, embedding2_dim]),
-                rtol=1e-5
-            )
+            embedding2_mask = mask[:, embedding2_start:embedding2_end, :]
+            first_mask = embedding2_mask[:, :1, :]
+            repeated_mask = tf.repeat(first_mask, embedding2_dim, axis=1)
+            self.assertAllClose(embedding2_mask, repeated_mask, rtol=1e-5)
         
         # Test in graph mode
         @tf.function
@@ -216,6 +214,51 @@ class TabNetTests(tf.test.TestCase):
         # Test forward pass
         output, _, _ = model(feature, training=True)
         self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        
+    def test_dict_input_auto_grouping(self):
+        """Test TabNet with dictionary input and automatic feature grouping"""
+        # Create test input with clear grouping structure
+        inputs = {
+            'embedding_1': tf.random.normal((self.batch_size, 16)),
+            'embedding_2': tf.random.normal((self.batch_size, 16)),
+            'numeric_1': tf.random.normal((self.batch_size, 1)),
+            'numeric_2': tf.random.normal((self.batch_size, 1)),
+            'categorical_1': tf.random.normal((self.batch_size, 8)),
+            'categorical_2': tf.random.normal((self.batch_size, 8))
+        }
+        
+        # Calculate total feature dimension
+        total_dims = sum(tensor.shape[-1] for tensor in inputs.values())
+        
+        # Initialize model
+        model = TabNet(
+            feature_dim=total_dims,
+            output_dim=self.output_dim
+        )
+        
+        # Test forward pass
+        output, masks, _ = model(inputs, training=True)
+        
+        # Verify output shape
+        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        
+        # Verify that embeddings are masked together
+        for mask in masks:
+            # Check embedding features (first 32 dimensions, 16+16)
+            embedding_mask = mask[:, :32]
+            self.assertAllClose(
+                embedding_mask[:, :16],
+                embedding_mask[:, 16:32],
+                rtol=1e-5
+            )
+            
+            # Check categorical features (last 16 dimensions, 8+8)
+            categorical_mask = mask[:, -16:]
+            self.assertAllClose(
+                categorical_mask[:, :8],
+                categorical_mask[:, 8:],
+                rtol=1e-5
+            )
 
 if __name__ == '__main__':
     tf.test.main() 
