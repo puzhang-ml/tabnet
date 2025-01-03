@@ -11,78 +11,72 @@ import tensorflow as tf
 import numpy as np
 from tabnet_block import TabNet
 
-# Generate synthetic data with grouped features
-def generate_data(n_samples=1000):
-    # Numeric features
-    num_features = np.random.normal(0, 1, (n_samples, 3))
+# Generate synthetic data with high dimensionality
+def generate_data(n_samples=10000):
+    # Example with 300 features:
+    # - 100 continuous features (dim=1 each)
+    # - 100 categorical features with 5 categories (dim=5 each)
+    # - 100 categorical features with 4 categories (dim=4 each)
+    continuous = np.random.normal(0, 1, (n_samples, 100))
+    cat_5 = np.eye(5)[np.random.randint(0, 5, (n_samples, 100))]
+    cat_4 = np.eye(4)[np.random.randint(0, 4, (n_samples, 100))]
     
-    # Categorical features (one-hot encoded)
-    cat1 = np.eye(4)[np.random.randint(0, 4, n_samples)]
-    cat2 = np.eye(3)[np.random.randint(0, 3, n_samples)]
-    
-    # Create target using combination of features
-    y = (num_features[:, 0] + cat1[:, 0] > 1).astype(np.float32)
-    
-    # Create dictionary of features
     features = {
-        'numeric': num_features.astype(np.float32),
-        'categorical_1': cat1.astype(np.float32),
-        'categorical_2': cat2.astype(np.float32)
+        'continuous': continuous.astype(np.float32),
+        'categorical_5': cat_5.reshape(n_samples, -1).astype(np.float32),  # 100 * 5 = 500 dims
+        'categorical_4': cat_4.reshape(n_samples, -1).astype(np.float32)   # 100 * 4 = 400 dims
     }
+    
+    # Create target (example: based on some features)
+    y = (np.sum(continuous[:, :10], axis=1) > 0).astype(np.float32)
     
     return features, y.reshape(-1, 1)
 
-# Feature columns definition
-feature_columns = {
-    'numeric': 3,
-    'categorical_1': 4,
-    'categorical_2': 3
-}
-
-# Generate data
-train_features, y_train = generate_data(10000)
-val_features, y_val = generate_data(2000)
-
-# Create model without specifying feature columns
-model = TabNet(
-    output_dim=1,
-    n_d=8,
-    n_a=8,
-    n_steps=3
-)
-
-# First call will infer feature dimensions
-features = {
-    'numeric': tf.random.normal((BATCH_SIZE, 3)),
-    'categorical_1': tf.random.uniform((BATCH_SIZE, 4)),
-    'categorical_2': tf.random.uniform((BATCH_SIZE, 3))
-}
-
-# Model will automatically build with correct feature dimensions
-out, masks = model(features, training=True)
-
-print("\nInferred feature columns:")
-print(model.feature_columns)
-
-print("\nFeature groups:")
-print(model.feature_groups)
-
-# Training parameters
-BATCH_SIZE = 256
-EPOCHS = 10
+# Hyperparameters for large feature set
+BATCH_SIZE = 8192
+EPOCHS = 100
 LR = 0.02
 
-# Create dataset
+# Generate data first
+train_features, y_train = generate_data(100000)  # 100k samples
+val_features, y_val = generate_data(20000)      # 20k samples
+
+# Create model with dynamic feature inference
+model = TabNet(
+    # feature_columns will be inferred from first input
+    output_dim=1,
+    n_d=64,
+    n_a=64,
+    n_steps=5,
+    gamma=1.5,
+    n_independent=2,
+    n_shared=2,
+    virtual_batch_size=512,
+    momentum=0.02
+)
+
+# First forward pass will trigger feature inference
+sample_batch = next(iter(train_dataset))
+_, _ = model(sample_batch[0], training=False)
+
+print("\nInferred Feature Dimensions:")
+print(model.feature_columns)
+
+print("\nFeature Groups:")
+print(model.feature_groups)
+
+# Create dataset with large batch size
 train_dataset = tf.data.Dataset.from_tensor_slices((train_features, y_train))
-train_dataset = train_dataset.shuffle(1000).batch(BATCH_SIZE)
+train_dataset = train_dataset.shuffle(10000).batch(BATCH_SIZE)
 
 val_dataset = tf.data.Dataset.from_tensor_slices((val_features, y_val))
 val_dataset = val_dataset.batch(BATCH_SIZE)
 
-# Optimizer
+# Optimizer with gradient clipping
 optimizer = tf.keras.optimizers.Adam(learning_rate=LR)
+gradient_clip_norm = 2.0
 
-# Training step
+# Training step with gradient clipping
 @tf.function
 def train_step(features, y):
     with tf.GradientTape() as tape:
@@ -90,10 +84,12 @@ def train_step(features, y):
         loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(y, y_pred))
         
     gradients = tape.gradient(loss, model.trainable_variables)
+    # Clip gradients to handle high dimensionality
+    gradients, _ = tf.clip_by_global_norm(gradients, gradient_clip_norm)
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
     return loss, masks
 
-# Training loop
+# Training loop with feature importance monitoring
 for epoch in range(EPOCHS):
     epoch_loss = []
     for x_batch, y_batch in train_dataset:
@@ -110,12 +106,13 @@ for epoch in range(EPOCHS):
     
     val_auc = tf.keras.metrics.AUC()(val_true, val_preds)
     print(f"Epoch {epoch+1}, Loss: {np.mean(epoch_loss):.4f}, Val AUC: {val_auc:.4f}")
-
-# Analyze feature importance per group
-_, masks = model(val_features)
-masks = masks.numpy()
-
-print("\nFeature Group Importance:")
-for name, indices in model.feature_groups.items():
-    importance = masks[:, :, indices].mean()
-    print(f"{name}: {importance:.4f}")
+    
+    # Monitor feature importance every 10 epochs
+    if (epoch + 1) % 10 == 0:
+        _, masks = model(next(iter(val_dataset))[0])
+        masks = masks.numpy()
+        
+        print("\nFeature Group Importance:")
+        for name, indices in model.feature_groups.items():
+            importance = masks[:, :, indices].mean()
+            print(f"{name}: {importance:.4f}")
