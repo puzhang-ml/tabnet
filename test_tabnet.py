@@ -64,10 +64,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=self.feature_dim,
             output_dim=self.output_dim,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7
         )
         
         # Create tf.function for graph mode
@@ -87,10 +87,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=self.feature_dim,
             output_dim=self.output_dim,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7
         )
         
         @tf.function
@@ -162,10 +162,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=total_dims,
             output_dim=self.output_dim,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7,
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7,
             grouped_features=grouped_features
         )
         
@@ -287,10 +287,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=total_dims,
             output_dim=self.output_dim,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7
         )
         
         # Test forward pass
@@ -334,10 +334,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=feature_dim,
             output_dim=1,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7,
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7,
             grouped_features=grouped_features
         )
         
@@ -401,10 +401,10 @@ class TabNetTests(tf.test.TestCase):
             model = TabNet(
                 feature_dim=feature_dim,
                 output_dim=1,
-                num_decision_steps=5,
-                relaxation_factor=1.5,
-                bn_epsilon=1e-5,
-                bn_momentum=0.7,
+                n_steps=5,
+                gamma=1.3,
+                epsilon=1e-5,
+                momentum=0.7,
                 grouped_features=grouped_features
             )
 
@@ -423,10 +423,10 @@ class TabNetTests(tf.test.TestCase):
             model = TabNet(
                 feature_dim=feature_dim,
                 output_dim=1,
-                num_decision_steps=5,
-                relaxation_factor=1.5,
-                bn_epsilon=1e-5,
-                bn_momentum=0.7,
+                n_steps=5,
+                gamma=1.3,
+                epsilon=1e-5,
+                momentum=0.7,
                 grouped_features=grouped_features
             )
 
@@ -439,10 +439,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=feature_dim,
             output_dim=1,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7,
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7,
             grouped_features=[]
         )
         
@@ -474,10 +474,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=feature_dim,
             output_dim=1,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7,
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7,
             grouped_features=grouped_features
         )
         
@@ -508,10 +508,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=feature_dim,
             output_dim=1,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7,
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7,
             grouped_features=grouped_features
         )
         
@@ -554,10 +554,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=feature_dim,
             output_dim=1,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7,
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7,
             grouped_features=grouped_features
         )
         
@@ -593,10 +593,10 @@ class TabNetTests(tf.test.TestCase):
         model = TabNet(
             feature_dim=feature_dim,
             output_dim=1,
-            num_decision_steps=5,
-            relaxation_factor=1.5,
-            bn_epsilon=1e-5,
-            bn_momentum=0.7,
+            n_steps=5,
+            gamma=1.3,
+            epsilon=1e-5,
+            momentum=0.7,
             grouped_features=grouped_features
         )
         
