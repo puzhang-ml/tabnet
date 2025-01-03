@@ -1,161 +1,156 @@
-import torch
-import torch.nn as nn
+import tensorflow as tf
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader, TensorDataset
+from typing import List, Dict
+import json
 
-# Assuming tabnet_core.py is in the same directory
-from tabnet_core import TabNetEncoder
+from tabnet_block import TabNet
 
-# Set random seeds for reproducibility
-torch.manual_seed(42)
+# Set random seeds
+tf.random.set_seed(42)
 np.random.seed(42)
 
-# Generate synthetic data
-def generate_data(n_samples=10000, n_features=50):
-    """Generate synthetic data for binary classification"""
-    # Generate random features
-    X = np.random.randn(n_samples, n_features)
+def generate_sample_data(num_samples=256):
+    """Generate sample data with meaningful patterns."""
+    # Create correlated features with clear grouping structure
+    base = tf.random.normal((num_samples, 4))
     
-    # Generate target: if sum of first 5 features > 0 and product of next 3 features > 0
-    # then class 1, else class 0
-    y = ((X[:, 0:5].sum(axis=1) > 0) & (X[:, 5:8].prod(axis=1) > 0)).astype(int)
+    # Create features with clear prefix grouping
+    features = {
+        'embedding_1': tf.concat([base[:, :2], tf.random.normal((num_samples, 14))], axis=1),  # 16 dims
+        'embedding_2': tf.concat([base[:, 2:], tf.random.normal((num_samples, 14))], axis=1),  # 16 dims
+        'numeric_1': 0.3 * base[:, 0:1] + 0.7 * tf.random.normal((num_samples, 1)),  # 1 dim
+        'numeric_2': 0.3 * base[:, 1:2] + 0.7 * tf.random.normal((num_samples, 1)),  # 1 dim
+        'categorical_1': tf.concat([0.3 * base[:, :2], tf.random.normal((num_samples, 6))], axis=1),  # 8 dims
+        'categorical_2': tf.concat([0.3 * base[:, 2:], tf.random.normal((num_samples, 6))], axis=1)   # 8 dims
+    }
     
-    # Split into train and test
-    train_size = int(0.8 * n_samples)
-    X_train, X_test = X[:train_size], X[train_size:]
-    y_train, y_test = y[:train_size], y[train_size:]
+    # Generate labels based on a combination of features
+    logits = (
+        0.5 * tf.reduce_sum(features['embedding_1'][:, :2], axis=1) +
+        0.3 * tf.reduce_sum(features['embedding_2'][:, :2], axis=1) +
+        0.2 * tf.squeeze(features['numeric_1']) +
+        0.1 * tf.reduce_sum(features['categorical_1'][:, :2], axis=1)
+    )
+    probs = tf.nn.sigmoid(logits)
+    labels = tf.cast(probs > 0.5, tf.float32)
     
-    # Scale features
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-    
-    return X_train, X_test, y_train, y_test
+    return features, labels
 
-# Create a complete TabNet model for binary classification
-class TabNetBinary(nn.Module):
-    def __init__(self, input_dim, n_d=8, n_a=8):
-        super(TabNetBinary, self).__init__()
-        self.tabnet = TabNetEncoder(
-            input_dim=input_dim,
-            output_dim=1,  # binary classification
-            n_d=n_d,
-            n_a=n_a,
-            n_steps=3,
-            gamma=1.3,
-            n_independent=2,
-            n_shared=2,
-            virtual_batch_size=128,
-            momentum=0.02
-        )
-        self.fc = nn.Linear(n_d, 1)  # Final classification layer
-        
-    def forward(self, x):
-        steps_output, M_loss = self.tabnet(x)
-        # Use the last step output for classification
-        last_step = steps_output[-1]
-        out = self.fc(last_step)
-        return torch.sigmoid(out.squeeze()), M_loss
-
-# Training function
-def train_model(model, train_loader, val_loader, device, epochs=100):
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
-    criterion = nn.BCELoss()
-    
-    best_val_auc = 0
-    patience = 10
-    patience_counter = 0
-    
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        for batch_X, batch_y in train_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            
-            optimizer.zero_grad()
-            y_pred, M_loss = model(batch_X)
-            loss = criterion(y_pred, batch_y) + 0.001 * M_loss
-            
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            
-        # Validation
-        model.eval()
-        val_preds = []
-        val_true = []
-        
-        with torch.no_grad():
-            for batch_X, batch_y in val_loader:
-                batch_X = batch_X.to(device)
-                y_pred, _ = model(batch_X)
-                val_preds.extend(y_pred.cpu().numpy())
-                val_true.extend(batch_y.numpy())
-        
-        val_auc = roc_auc_score(val_true, val_preds)
-        
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch}")
-            break
-            
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}: Loss = {total_loss:.4f}, Val AUC = {val_auc:.4f}")
-    
-    return best_val_auc
+def create_dataset(features, labels, batch_size):
+    """Create TensorFlow dataset from features dictionary and labels."""
+    dataset = tf.data.Dataset.from_tensor_slices((features, labels))
+    return dataset.shuffle(buffer_size=10000).batch(batch_size)
 
 def main():
     # Parameters
-    BATCH_SIZE = 256
+    BATCH_SIZE = 1024
+    EPOCHS = 50
     N_SAMPLES = 10000
-    N_FEATURES = 50
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    LEARNING_RATE = 0.01
     
-    # Generate data
-    print("Generating synthetic data...")
-    X_train, X_test, y_train, y_test = generate_data(N_SAMPLES, N_FEATURES)
+    print("Generating data...")
+    train_features, train_labels = generate_sample_data(N_SAMPLES)
+    valid_features, valid_labels = generate_sample_data(N_SAMPLES // 5)
     
-    # Create data loaders
-    train_dataset = TensorDataset(
-        torch.FloatTensor(X_train),
-        torch.FloatTensor(y_train)
+    # Create datasets
+    train_dataset = create_dataset(train_features, train_labels, BATCH_SIZE)
+    valid_dataset = create_dataset(valid_features, valid_labels, BATCH_SIZE)
+    
+    # Calculate total feature dimension
+    total_dims = sum(tensor.shape[-1] for tensor in train_features.values())
+    
+    # Initialize model without explicit grouped_features
+    # The model will infer groups automatically from feature names
+    print("\nInitializing TabNet model...")
+    model = TabNet(
+        feature_dim=total_dims,
+        output_dim=1,
+        n_d=8,
+        n_a=8,
+        n_steps=3,
+        gamma=1.3,
+        epsilon=1e-5,
+        momentum=0.7
     )
-    test_dataset = TensorDataset(
-        torch.FloatTensor(X_test),
-        torch.FloatTensor(y_test)
+    
+    # Initialize optimizer with learning rate schedule
+    initial_learning_rate = LEARNING_RATE
+    decay_steps = 1000
+    decay_rate = 0.9
+    
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate,
+        decay_steps=decay_steps,
+        decay_rate=decay_rate,
+        staircase=True
     )
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     
-    # Initialize model
-    print("Initializing TabNet model...")
-    model = TabNetBinary(input_dim=N_FEATURES).to(DEVICE)
+    # Training loop
+    print("\nStarting training...")
+    best_valid_auc = 0
+    patience = 10
+    patience_counter = 0
     
-    # Train model
-    print("Starting training...")
-    best_auc = train_model(model, train_loader, test_loader, DEVICE)
-    print(f"Training completed. Best AUC: {best_auc:.4f}")
+    for epoch in range(EPOCHS):
+        # Training
+        train_loss = 0
+        train_batches = 0
+        for x_batch, y_batch in train_dataset:
+            with tf.GradientTape() as tape:
+                # First forward pass will trigger automatic feature grouping
+                outputs = model(x_batch, training=True)
+                y_pred = outputs[0] if isinstance(outputs, tuple) else outputs
+                y_pred = tf.squeeze(y_pred)
+                
+                # Calculate loss
+                bce_loss = tf.reduce_mean(
+                    tf.keras.losses.binary_crossentropy(y_batch, y_pred)
+                )
+                sparsity_loss = outputs[2] if isinstance(outputs, tuple) else 0.0
+                loss = bce_loss + sparsity_loss
+            
+            gradients = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+            
+            train_loss += loss.numpy()
+            train_batches += 1
+        
+        train_loss /= train_batches
+        
+        # Validation
+        valid_preds = []
+        valid_labels_list = []
+        for x_batch, y_batch in valid_dataset:
+            outputs = model(x_batch, training=False)
+            y_pred = outputs[0] if isinstance(outputs, tuple) else outputs
+            y_pred = tf.squeeze(y_pred)
+            valid_preds.extend(y_pred.numpy())
+            valid_labels_list.extend(y_batch.numpy())
+        
+        valid_preds = np.array(valid_preds)
+        valid_labels_list = np.array(valid_labels_list)
+        valid_auc = roc_auc_score(valid_labels_list, valid_preds)
+        
+        print(f"Epoch {epoch + 1}/{EPOCHS}")
+        print(f"Train Loss: {train_loss:.4f}")
+        print(f"Valid AUC: {valid_auc:.4f}")
+        print(f"Learning Rate: {lr_schedule(optimizer.iterations).numpy():.6f}")
+        
+        # Early stopping
+        if valid_auc > best_valid_auc:
+            best_valid_auc = valid_auc
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("\nEarly stopping triggered!")
+                break
     
-    # Final evaluation
-    model.eval()
-    test_preds = []
-    with torch.no_grad():
-        for batch_X, _ in test_loader:
-            batch_X = batch_X.to(DEVICE)
-            y_pred, _ = model(batch_X)
-            test_preds.extend(y_pred.cpu().numpy())
-    
-    final_auc = roc_auc_score(y_test, test_preds)
-    print(f"Final Test AUC: {final_auc:.4f}")
+    print(f"\nTraining finished! Best validation AUC: {best_valid_auc:.4f}")
 
 if __name__ == "__main__":
-    main() 
+    main()
