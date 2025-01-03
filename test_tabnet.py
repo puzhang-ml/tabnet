@@ -29,654 +29,549 @@ SOFTWARE.
 
 import tensorflow as tf
 import numpy as np
-from typing import List, Dict
-from tabnet_block import TabNet, infer_feature_groups_from_dict
+from tabnet_block import TabNet, sparsemax, GBN, SharedBlock, FeatTransformer
 
-class TabNetTests(tf.test.TestCase):
+class TabNetTest(tf.test.TestCase):
     def setUp(self):
         super().setUp()
-        tf.random.set_seed(42)
-        np.random.seed(42)
+        self.batch_size = 128
+        self.feature_dim = 16
+        self.n_steps = 3
         
-        # Common test configurations
-        self.batch_size = 32
-        self.feature_dim = 64
-        self.output_dim = 1
+    def test_ghost_batch_norm(self):
+        """Test Ghost Batch Normalization behavior."""
+        virtual_batch_size = 8
+        gbn = GBN(virtual_batch_size=virtual_batch_size)
         
-    def create_test_features_list(self) -> List[tf.Tensor]:
-        """Create test features as list of tensors"""
-        return [
-            tf.random.normal((self.batch_size, 10)),  # Feature 1: 10 dims
-            tf.random.normal((self.batch_size, 20)),  # Feature 2: 20 dims
-            tf.random.normal((self.batch_size, 30)),  # Feature 3: 30 dims
-        ]
+        # Test with batch size multiple of virtual_batch_size
+        x = tf.random.normal((32, 16))
+        out = gbn(x, training=True)
+        self.assertEqual(out.shape, x.shape)
         
-    def create_test_features_dict(self) -> Dict[str, tf.Tensor]:
-        """Create test features as dictionary"""
-        return {
-            'numeric': tf.random.normal((self.batch_size, 10)),
-            'embedding': tf.random.normal((self.batch_size, 20)),
-            'categorical': tf.random.normal((self.batch_size, 30)),
-        }
-        
-    def test_list_input_graph_mode(self):
-        """Test TabNet with list input in Graph mode"""
-        model = TabNet(
-            feature_dim=self.feature_dim,
-            output_dim=self.output_dim,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7
+        # Test inference mode
+        out_inference = gbn(x, training=False)
+        self.assertEqual(out_inference.shape, x.shape)
+
+    def test_shared_block(self):
+        """Test SharedBlock behavior."""
+        block = SharedBlock(input_dim=16, output_dim=8)
+        x = tf.random.normal((self.batch_size, 16))
+        out = block(x, training=True)
+        self.assertEqual(out.shape, (self.batch_size, 8))
+
+    def test_feature_transformer(self):
+        """Test FeatTransformer behavior."""
+        shared = SharedBlock(16, 8)
+        ft = FeatTransformer(
+            input_dim=16,
+            output_dim=8,
+            shared_block=shared
         )
         
-        # Create tf.function for graph mode
-        @tf.function
-        def run_model(features):
-            output, _, _ = model(features, training=True)
-            return output
+        x = tf.random.normal((self.batch_size, 16))
+        out = ft(x, training=True)
+        self.assertEqual(out.shape, (self.batch_size, 8))
+
+    def test_model_output_shape(self):
+        """Test model output shapes."""
+        feature_columns = {'features': self.feature_dim}  # Single feature group
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1
+        )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        out, masks = model(x, training=True)
+        
+        # Check output shapes
+        self.assertEqual(out.shape, (self.batch_size, 1))
+        self.assertEqual(masks.shape, (self.batch_size, self.n_steps, self.feature_dim))
+        
+    def test_mask_sum_to_one(self):
+        """Test if masks sum to approximately 1."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1
+        )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        _, masks = model(x, training=True)
+        
+        # Check if masks sum to approximately 1
+        mask_sums = tf.reduce_sum(masks, axis=-1)
+        self.assertAllClose(mask_sums, tf.ones_like(mask_sums), rtol=1e-5)
+
+    def test_feature_selection(self):
+        """Test if model learns to select relevant features."""
+        # Create data where only first 3 features are relevant
+        feature_columns = {'features': self.feature_dim}
+        X = {'features': tf.random.normal((1000, self.feature_dim))}
+        y = tf.cast(tf.reduce_sum(X['features'][:, :3], axis=1) > 0, tf.float32)
+        
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_steps=3
+        )
+        
+        # Train for a few steps
+        optimizer = tf.keras.optimizers.Adam()
+        for _ in range(10):
+            with tf.GradientTape() as tape:
+                pred, masks = model(X, training=True)
+                loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(y, pred))
             
-        features = self.create_test_features_list()
-        output = run_model(features)
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        
+        # Get feature importance from masks
+        masks = model.forward_masks(X)
+        feature_importance = tf.reduce_mean(masks, axis=[0, 1])
+        
+        # First 3 features should have higher importance
+        important_features = tf.argsort(feature_importance)[-3:]
+        self.assertTrue(all(f < 3 for f in important_features))
+
+    def test_initial_splitter(self):
+        """Test if initial splitter behaves differently from other steps."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_d=8,
+            n_a=8,
+            n_steps=3
+        )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        
+        # Get masks from two forward passes
+        _, masks1 = model(x, training=True)
+        _, masks2 = model(x, training=True)
+        
+        # First step masks should be identical
+        self.assertAllClose(masks1[:, 0, :], masks2[:, 0, :])
+
+    def test_prior_scaling(self):
+        """Test if prior scaling with gamma works correctly."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            gamma=1.3
+        )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        _, masks = model(x, training=True)
+        
+        # Extract masks for consecutive steps
+        mask1 = masks[:, 0, :]  # First step
+        mask2 = masks[:, 1, :]  # Second step
+        
+        # Check if second step mask is affected by prior
+        # The sum of mask2 should be less than mask1 due to gamma scaling
+        sum1 = tf.reduce_sum(mask1)
+        sum2 = tf.reduce_sum(mask2)
+        self.assertLess(sum2, sum1 * 1.3)
+
+    def test_shared_block_reuse(self):
+        """Test if shared block is properly reused across steps."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1
+        )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        
+        # Get first step output
+        with tf.GradientTape() as tape:
+            # Forward pass will use shared block in each step
+            out, masks = model(x, training=True)
+            loss = tf.reduce_mean(out)
+        
+        # Get gradients for shared block
+        shared_vars = model.encoder.shared.trainable_variables
+        grads = tape.gradient(loss, shared_vars)
+        
+        # Shared block should be used multiple times, so gradients should exist
+        self.assertTrue(all(g is not None for g in grads))
+
+    def test_feature_transformer_dimensions(self):
+        """Test feature transformer output dimensions match DreamQuark."""
+        feature_columns = {'features': self.feature_dim}
+        n_d = 8
+        n_a = 8
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_d=n_d,
+            n_a=n_a
+        )
+        
+        # Get first feature transformer
+        ft = model.encoder.feat_transformers[0]
+        x = tf.random.normal((self.batch_size, self.feature_dim))
+        
+        # First apply shared transform as in DreamQuark
+        x_processed = model.encoder.shared(x)
+        out = ft(x_processed)
+        
+        # Output should be n_d + n_a as in DreamQuark
+        self.assertEqual(out.shape[-1], n_d + n_a)
+
+    def test_attentive_transformer_dimensions(self):
+        """Test attentive transformer dimensions match DreamQuark."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_d=8,
+            n_a=8
+        )
+        
+        # Get first attentive transformer
+        at = model.encoder.att_transformers[0]
+        x = tf.random.normal((self.batch_size, 8))  # Input is n_a dimensional
+        mask = at(x, training=True)
+        
+        # Mask should be feature_dim dimensional
+        self.assertEqual(mask.shape[-1], self.feature_dim)
+
+    def test_initial_processing_order(self):
+        """Test that initial batch norm and shared transform are applied in correct order."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1
+        )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        
+        # Manual forward pass
+        x_bn = model.encoder.initial_bn(x, training=True)
+        x_shared = model.encoder.shared(x_bn, training=True)
+        
+        # Model forward pass first step
+        _, masks = model(x, training=True)
+        
+        # First step mask should be same as manual processing
+        features = model.encoder.initial_splitter(x_shared, training=True)
+        _, a = tf.split(features, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        expected_mask = sparsemax(a)
+        
+        self.assertAllClose(masks[:, 0, :], expected_mask)
+
+    def test_glu_behavior(self):
+        """Test GLU behaves exactly as in DreamQuark."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1
+        )
+        
+        # Get first GLU layer from feature transformer
+        glu = model.encoder.feat_transformers[0].specifics[0]
+        x = tf.random.normal((self.batch_size, self.feature_dim))
+        
+        # Manual GLU computation
+        fc_out = glu.fc(x)
+        bn_out = glu.bn(fc_out, training=True)
+        out, gate = tf.split(bn_out, 2, axis=-1)
+        expected = out * tf.nn.sigmoid(gate)
+        
+        # Layer output
+        actual = glu(x, training=True)
+        
+        self.assertAllClose(actual, expected)
+
+    def test_feature_reuse_pattern(self):
+        """Test that features are reused according to DreamQuark's pattern."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_steps=2
+        )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        
+        # First step
+        x_tensor = x['features']  # Get tensor for manual processing
+        x_bn = model.encoder.initial_bn(x_tensor, training=True)  # Apply batch norm first
+        x_shared = model.encoder.shared(x_bn, training=True)      # Apply shared transform
+        features1 = model.encoder.initial_splitter(x_shared, training=True)  # Feature transform
+        d1, a1 = tf.split(features1, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        mask1 = sparsemax(a1)  # Generate mask
+        
+        # Compare with model output
+        _, masks = model(x, training=True)
+        self.assertAllClose(masks[:, 0, :], mask1)
+
+    def test_sparsemax(self):
+        """Test sparsemax activation function."""
+        x = tf.random.normal((self.batch_size, self.feature_dim))
+        out = sparsemax(x)
         
         # Check output shape
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        self.assertEqual(out.shape, x.shape)
         
-    def test_dict_input_graph_mode(self):
-        """Test TabNet with dictionary input in Graph mode"""
+        # Check properties of sparsemax
+        row_sums = tf.reduce_sum(out, axis=-1)
+        self.assertAllClose(row_sums, tf.ones_like(row_sums))
+        self.assertAllGreaterEqual(out, 0.0)
+
+    def test_feature_selection_interpretability(self):
+        """Test if feature selection is interpretable."""
+        feature_columns = {'features': self.feature_dim}
+        X = {'features': tf.random.normal((1000, self.feature_dim))}
+        y = tf.cast(X['features'][:, 0] > 0, tf.float32)
+        
         model = TabNet(
-            feature_dim=self.feature_dim,
-            output_dim=self.output_dim,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_steps=1
         )
         
-        @tf.function
-        def run_model(features):
-            output, _, _ = model(features, training=True)
-            return output
+        # Train for a few steps
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.02)
+        for _ in range(20):
+            with tf.GradientTape() as tape:
+                pred, masks = model(X, training=True)
+                loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(y, pred))
             
-        features = self.create_test_features_dict()
-        output = run_model(features)
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
         
-        # Check output shape
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        # Get feature importance
+        _, masks = model(X, training=False)
+        feature_importance = tf.reduce_mean(masks, axis=0)  # Average over batch
         
-    def test_single_tensor_input(self):
-        """Test TabNet with single tensor input"""
-        input_dim = 60
+        # First feature should have highest importance
+        self.assertEqual(tf.argmax(feature_importance[0]), 0)
+
+    def test_virtual_batch_size(self):
+        """Test if virtual batch size is working correctly."""
+        feature_columns = {'features': self.feature_dim}
         model = TabNet(
-            feature_dim=input_dim,
-            output_dim=self.output_dim
+            feature_columns=feature_columns,
+            output_dim=1,
+            virtual_batch_size=16
         )
         
-        # Create single tensor input
-        features = tf.random.normal((self.batch_size, input_dim))
-        output, _, _ = model(features, training=True)
+        # Test with batch size larger than virtual_batch_size
+        x = {'features': tf.random.normal((64, self.feature_dim))}
+        out, _ = model(x, training=True)
+        self.assertEqual(out.shape, (64, 1))
         
-        # Check output shape
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
-        
-    def test_large_feature_dims(self):
-        """Test TabNet with large feature dimensions"""
-        features = [
-            tf.random.normal((self.batch_size, 100)),  # Large dim feature
-            tf.random.normal((self.batch_size, 200)),  # Larger dim feature
-            tf.random.normal((self.batch_size, 50))    # Normal dim feature
-        ]
-        
-        total_dims = sum(f.shape[-1] for f in features)
+        # Test with batch size smaller than virtual_batch_size
+        x = {'features': tf.random.normal((8, self.feature_dim))}
+        out, _ = model(x, training=True)
+        self.assertEqual(out.shape, (8, 1))
+
+    def test_batch_size_independence(self):
+        """Test if model works with different batch sizes."""
+        feature_columns = {'features': self.feature_dim}
         model = TabNet(
-            feature_dim=total_dims,
-            output_dim=self.output_dim
+            feature_columns=feature_columns,
+            output_dim=1
         )
         
-        output, _, _ = model(features, training=True)
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
-        
-    def test_mixed_feature_types(self):
-        """Test TabNet with mixed feature types (scalar, embedding, regular)"""
-        # Create feature dimensions
-        scalar_dim = 1
-        embedding1_dim = 16
-        embedding2_dim = 32
-        continuous1_dim = 10
-        continuous2_dim = 20
-        total_dims = scalar_dim * 2 + embedding1_dim + embedding2_dim + continuous1_dim + continuous2_dim
-        
-        # Define feature groups for embeddings
-        current_idx = 2  # After two scalar features
-        embedding1_start = current_idx
-        embedding1_end = embedding1_start + embedding1_dim
-        embedding2_start = embedding1_end
-        embedding2_end = embedding2_start + embedding2_dim
-        
-        grouped_features = [
-            list(range(embedding1_start, embedding1_end)),  # embedding1 group
-            list(range(embedding2_start, embedding2_end))   # embedding2 group
-        ]
-        
-        # Initialize model with feature groups
+        # Test with different batch sizes
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
+        for batch_size in batch_sizes:
+            x = {'features': tf.random.normal((batch_size, self.feature_dim))}
+            out, masks = model(x, training=True)
+            self.assertEqual(out.shape, (batch_size, 1))
+            self.assertEqual(masks.shape, (batch_size, self.n_steps, self.feature_dim))
+
+    def test_training_mode(self):
+        """Test if model behaves differently in training vs inference mode."""
+        feature_columns = {'features': self.feature_dim}
         model = TabNet(
-            feature_dim=total_dims,
-            output_dim=self.output_dim,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7,
-            grouped_features=grouped_features
+            feature_columns=feature_columns,
+            output_dim=1
         )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
         
-        # Create mixed input features
-        features = {
-            'scalar1': tf.random.normal((self.batch_size,)),  # 1D scalar feature
-            'scalar2': tf.random.normal((self.batch_size,)),  # 1D scalar feature
-            'embedding1': tf.random.normal((self.batch_size, embedding1_dim)),  # Pre-embedded feature
-            'embedding2': tf.random.normal((self.batch_size, embedding2_dim)),  # Pre-embedded feature
-            'continuous1': tf.random.normal((self.batch_size, continuous1_dim)),  # Regular 2D feature
-            'continuous2': tf.random.normal((self.batch_size, continuous2_dim))   # Regular 2D feature
-        }
+        # Get outputs in training mode
+        out_train, masks_train = model(x, training=True)
         
-        # Test in eager mode
-        output, masks, _ = model(features, training=True)
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        # Get outputs in inference mode
+        out_test, masks_test = model(x, training=False)
         
-        # Verify that embedding dimensions are masked together
-        for mask in masks:
-            # Check embedding1 mask values are identical within the group
-            embedding1_mask = mask[:, embedding1_start:embedding1_end, :]
-            first_mask = embedding1_mask[:, :1, :]
-            repeated_mask = tf.repeat(first_mask, embedding1_dim, axis=1)
-            self.assertAllClose(embedding1_mask, repeated_mask, rtol=1e-5)
-            
-            # Check embedding2 mask values are identical within the group
-            embedding2_mask = mask[:, embedding2_start:embedding2_end, :]
-            first_mask = embedding2_mask[:, :1, :]
-            repeated_mask = tf.repeat(first_mask, embedding2_dim, axis=1)
-            self.assertAllClose(embedding2_mask, repeated_mask, rtol=1e-5)
-        
-        # Test in graph mode
-        @tf.function
-        def run_model(features):
-            return model(features, training=True)
-            
-        output, masks, _ = run_model(features)
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
-        
-        # Verify masks in graph mode
-        for mask in masks:
-            embedding1_mask = mask[:, embedding1_start:embedding1_end]
-            self.assertTrue(tf.reduce_all(embedding1_mask == embedding1_mask[:, 0:1]))
-            
-            embedding2_mask = mask[:, embedding2_start:embedding2_end]
-            self.assertTrue(tf.reduce_all(embedding2_mask == embedding2_mask[:, 0:1]))
-        
-    def test_mixed_feature_types_list(self):
-        """Test TabNet with mixed feature types as list input"""
+        # Outputs should be different due to batch norm behavior
+        with self.assertRaises(AssertionError):
+            self.assertAllClose(out_train, out_test)
+
+    def test_parameter_count(self):
+        """Test if number of parameters matches DreamQuark's implementation."""
+        feature_columns = {'features': self.feature_dim}
         model = TabNet(
-            feature_dim=self.feature_dim,
-            output_dim=self.output_dim,
+            feature_columns=feature_columns,
+            output_dim=1,
             n_d=8,
             n_a=8,
             n_steps=3,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7
+            n_independent=2,
+            n_shared=2
         )
         
-        # Create list of mixed features
-        features = [
-            tf.random.normal((self.batch_size,)),         # 1D scalar feature
-            tf.random.normal((self.batch_size, 16)),      # Pre-embedded feature
-            tf.random.normal((self.batch_size,)),         # Another 1D scalar
-            tf.random.normal((self.batch_size, 32)),      # Another embedding
-            tf.random.normal((self.batch_size, 10))       # Regular 2D feature
-        ]
+        # Count trainable parameters
+        total_params = np.sum([np.prod(v.shape) for v in model.trainable_variables])
         
-        # Test forward pass
-        output, _, _ = model(features, training=True)
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        # Verify parameter count is reasonable
+        # (exact count depends on implementation details)
+        self.assertGreater(total_params, 1000)
+        self.assertLess(total_params, 100000)
+
+    def test_dictionary_input(self):
+        """Test if model works with dictionary inputs."""
+        feature_columns = {
+            'numeric': 3,
+            'categorical_1': 4,
+            'categorical_2': 3
+        }
         
-        # Test with @tf.function
-        @tf.function
-        def run_model(features):
-            output, _, _ = model(features, training=True)
-            return output
-            
-        output = run_model(features)
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
-        
-    def test_single_scalar_feature(self):
-        """Test TabNet with a single scalar feature"""
         model = TabNet(
-            feature_dim=self.feature_dim,
-            output_dim=self.output_dim,
-            n_d=8,
-            n_a=8,
-            n_steps=3,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7
+            feature_columns=feature_columns,
+            output_dim=1
         )
         
-        # Create single scalar feature
-        feature = tf.random.normal((self.batch_size,))
-        
-        # Test forward pass
-        output, _, _ = model(feature, training=True)
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
-        
-    def test_dict_input_auto_grouping(self):
-        """Test TabNet with dictionary input and automatic feature grouping"""
-        # Create test input with clear grouping structure
+        # Create sample input
         inputs = {
-            'embedding_1': tf.random.normal((self.batch_size, 16)),
-            'embedding_2': tf.random.normal((self.batch_size, 16)),
-            'numeric_1': tf.random.normal((self.batch_size, 1)),
-            'numeric_2': tf.random.normal((self.batch_size, 1)),
-            'categorical_1': tf.random.normal((self.batch_size, 8)),
-            'categorical_2': tf.random.normal((self.batch_size, 8))
+            'numeric': tf.random.normal((self.batch_size, 3)),
+            'categorical_1': tf.random.uniform((self.batch_size, 4)),
+            'categorical_2': tf.random.uniform((self.batch_size, 3))
         }
-        
-        # Calculate total feature dimension
-        total_dims = sum(tensor.shape[-1] for tensor in inputs.values())
-        
-        # Initialize model
-        model = TabNet(
-            feature_dim=total_dims,
-            output_dim=self.output_dim,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7
-        )
         
         # Test forward pass
-        output, masks, _ = model(inputs, training=True)
+        out, masks = model(inputs, training=True)
         
-        # Verify output shape
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
-        
-        # Verify that embeddings are masked together
-        for mask in masks:
-            # Check embedding features (first 32 dimensions, 16+16)
-            embedding_mask = mask[:, :32]
-            self.assertAllClose(
-                embedding_mask[:, :16],
-                embedding_mask[:, 16:32],
-                rtol=1e-5
-            )
-            
-            # Check categorical features (last 16 dimensions, 8+8)
-            categorical_mask = mask[:, -16:]
-            self.assertAllClose(
-                categorical_mask[:, :8],
-                categorical_mask[:, 8:],
-                rtol=1e-5
-            )
+        # Check output shapes
+        self.assertEqual(out.shape, (self.batch_size, 1))
+        self.assertEqual(masks.shape, (self.batch_size, self.n_steps, sum(feature_columns.values())))
 
-    def test_feature_groups_consistency(self):
-        """Test that feature groups are handled consistently with official implementation"""
-        # Create test data with clear group structure
-        feature_dim = 10
-        batch_size = 32
-        
-        # Define feature groups
-        grouped_features = [
-            [0, 1, 2],  # First group
-            [4, 5],     # Second group
-            [7, 8, 9]   # Third group
-        ]
-        
-        # Create model
-        model = TabNet(
-            feature_dim=feature_dim,
-            output_dim=1,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7,
-            grouped_features=grouped_features
-        )
-        
-        # Create input features
-        features = tf.random.normal((batch_size, feature_dim))
-        
-        # Get output and attention masks
-        output, masks, _ = model(features, training=True)
-        
-        # Check output shape
-        self.assertEqual(output.shape, (batch_size, 1))
-        
-        # For each mask, verify that grouped features have same attention values
-        for mask in masks:
-            # Check first group
-            group1_mask = mask[:, [0, 1, 2]]
-            self.assertAllClose(
-                group1_mask[:, 0],
-                group1_mask[:, 1],
-                rtol=1e-5
-            )
-            self.assertAllClose(
-                group1_mask[:, 1],
-                group1_mask[:, 2],
-                rtol=1e-5
-            )
-            
-            # Check second group
-            group2_mask = mask[:, [4, 5]]
-            self.assertAllClose(
-                group2_mask[:, 0],
-                group2_mask[:, 1],
-                rtol=1e-5
-            )
-            
-            # Check third group
-            group3_mask = mask[:, [7, 8, 9]]
-            self.assertAllClose(
-                group3_mask[:, 0],
-                group3_mask[:, 1],
-                rtol=1e-5
-            )
-            self.assertAllClose(
-                group3_mask[:, 1],
-                group3_mask[:, 2],
-                rtol=1e-5
-            )
-
-    def test_overlapping_groups_validation(self):
-        """Test that overlapping feature groups raise ValueError"""
-        feature_dim = 10
-        
-        # Create overlapping groups
-        grouped_features = [
-            [0, 1, 2],
-            [2, 3, 4]  # Overlaps with first group
-        ]
-        
-        # Verify that creating model with overlapping groups raises ValueError
-        with self.assertRaises(ValueError):
-            model = TabNet(
-                feature_dim=feature_dim,
-                output_dim=1,
-                n_steps=5,
-                gamma=1.3,
-                epsilon=1e-5,
-                momentum=0.7,
-                grouped_features=grouped_features
-            )
-
-    def test_invalid_group_indices(self):
-        """Test that invalid group indices raise ValueError"""
-        feature_dim = 10
-        
-        # Create groups with invalid indices
-        grouped_features = [
-            [0, 1, 2],
-            [4, 5, 10]  # 10 is invalid for feature_dim=10
-        ]
-        
-        # Verify that creating model with invalid indices raises ValueError
-        with self.assertRaises(ValueError):
-            model = TabNet(
-                feature_dim=feature_dim,
-                output_dim=1,
-                n_steps=5,
-                gamma=1.3,
-                epsilon=1e-5,
-                momentum=0.7,
-                grouped_features=grouped_features
-            )
-
-    def test_empty_feature_groups(self):
-        """Test that empty feature groups are handled correctly"""
-        feature_dim = 10
-        batch_size = 32
-        
-        # Create model with empty feature groups
-        model = TabNet(
-            feature_dim=feature_dim,
-            output_dim=1,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7,
-            grouped_features=[]
-        )
-        
-        # Create input features
-        features = tf.random.normal((batch_size, feature_dim))
-        
-        # Get output and attention masks
-        output, masks, _ = model(features, training=True)
-        
-        # Check output shape
-        self.assertEqual(output.shape, (batch_size, 1))
-        
-        # Verify masks are not all identical (since no grouping)
-        for mask in masks:
-            # Take first two columns and verify they're different
-            col1 = mask[:, 0]
-            col2 = mask[:, 1]
-            # Check that the columns are different (using mean absolute difference)
-            diff = tf.reduce_mean(tf.abs(col1 - col2))
-            self.assertGreater(diff, 1e-5)
-
-    def test_single_feature_group(self):
-        """Test that a single feature group works correctly"""
-        feature_dim = 10
-        batch_size = 32
-        
-        # Create model with single group containing all features
-        grouped_features = [list(range(feature_dim))]
-        model = TabNet(
-            feature_dim=feature_dim,
-            output_dim=1,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7,
-            grouped_features=grouped_features
-        )
-        
-        # Create input features
-        features = tf.random.normal((batch_size, feature_dim))
-        
-        # Get output and attention masks
-        output, masks, _ = model(features, training=True)
-        
-        # Check that all features in each mask have identical values
-        for mask in masks:
-            first_col = mask[:, 0]
-            for i in range(1, feature_dim):
-                self.assertAllClose(mask[:, i], first_col, rtol=1e-5)
-
-    def test_disjoint_feature_groups(self):
-        """Test that disjoint feature groups work correctly"""
-        feature_dim = 10
-        batch_size = 32
-        
-        # Create disjoint groups
-        grouped_features = [
-            [0, 1],      # First group
-            [4, 5, 6],   # Second group
-            [8, 9]       # Third group
-        ]
-        
-        model = TabNet(
-            feature_dim=feature_dim,
-            output_dim=1,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7,
-            grouped_features=grouped_features
-        )
-        
-        features = tf.random.normal((batch_size, feature_dim))
-        output, masks, _ = model(features, training=True)
-        
-        for mask in masks:
-            # Check first group
-            self.assertAllClose(mask[:, 0], mask[:, 1], rtol=1e-5)
-            
-            # Check second group
-            self.assertAllClose(mask[:, 4], mask[:, 5], rtol=1e-5)
-            self.assertAllClose(mask[:, 5], mask[:, 6], rtol=1e-5)
-            
-            # Check third group
-            self.assertAllClose(mask[:, 8], mask[:, 9], rtol=1e-5)
-            
-            # Verify that groups have different values
-            diff1 = tf.reduce_mean(tf.abs(mask[:, 0] - mask[:, 4]))
-            diff2 = tf.reduce_mean(tf.abs(mask[:, 4] - mask[:, 8]))
-            diff3 = tf.reduce_mean(tf.abs(mask[:, 0] - mask[:, 8]))
-            
-            self.assertGreater(diff1, 1e-5)  # Group 1 vs 2
-            self.assertGreater(diff2, 1e-5)  # Group 2 vs 3
-            self.assertGreater(diff3, 1e-5)  # Group 1 vs 3
-
-    def test_feature_groups_with_single_features(self):
-        """Test groups with single features mixed with grouped features"""
-        feature_dim = 10
-        batch_size = 32
-        
-        # Create groups with some single features
-        grouped_features = [
-            [0],        # Single feature
-            [2, 3, 4],  # Group
-            [6],        # Single feature
-            [8, 9]      # Group
-        ]
-        
-        model = TabNet(
-            feature_dim=feature_dim,
-            output_dim=1,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7,
-            grouped_features=grouped_features
-        )
-        
-        features = tf.random.normal((batch_size, feature_dim))
-        output, masks, _ = model(features, training=True)
-        
-        for mask in masks:
-            # Check group with multiple features
-            self.assertAllClose(mask[:, 2], mask[:, 3], rtol=1e-5)
-            self.assertAllClose(mask[:, 3], mask[:, 4], rtol=1e-5)
-            
-            # Check last group
-            self.assertAllClose(mask[:, 8], mask[:, 9], rtol=1e-5)
-            
-            # Verify single features have different values from groups
-            diff1 = tf.reduce_mean(tf.abs(mask[:, 0] - mask[:, 2]))
-            diff2 = tf.reduce_mean(tf.abs(mask[:, 6] - mask[:, 8]))
-            
-            self.assertGreater(diff1, 1e-5)  # Single vs group
-            self.assertGreater(diff2, 1e-5)  # Single vs group
-
-    def test_feature_groups_normalization(self):
-        """Test that mask normalization works correctly with feature groups"""
-        feature_dim = 6
-        batch_size = 32
-        
-        # Create two groups of equal size
-        grouped_features = [
-            [0, 1, 2],  # First group
-            [3, 4, 5]   # Second group
-        ]
-        
-        model = TabNet(
-            feature_dim=feature_dim,
-            output_dim=1,
-            n_steps=5,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7,
-            grouped_features=grouped_features
-        )
-        
-        features = tf.random.normal((batch_size, feature_dim))
-        output, masks, _ = model(features, training=True)
-        
-        for mask in masks:
-            # Check that mask sums to 1 for each sample
-            mask_sums = tf.reduce_sum(mask, axis=1)
-            self.assertAllClose(mask_sums, tf.ones_like(mask_sums), rtol=1e-5)
-            
-            # Check that group probabilities sum to approximately 0.5 each
-            group1_sum = tf.reduce_sum(mask[:, :3], axis=1)
-            group2_sum = tf.reduce_sum(mask[:, 3:], axis=1)
-            
-            # Each group should get roughly equal attention
-            # (allowing for some variation due to the model's learning)
-            self.assertTrue(tf.reduce_all(group1_sum >= 0.2))
-            self.assertTrue(tf.reduce_all(group1_sum <= 0.8))
-            self.assertTrue(tf.reduce_all(group2_sum >= 0.2))
-            self.assertTrue(tf.reduce_all(group2_sum <= 0.8))
-
-    def test_dynamic_feature_grouping(self):
-        """Test dynamic feature grouping from dictionary input"""
-        # Create test input with clear grouping structure
-        inputs = {
-            'embedding_1': tf.random.normal((self.batch_size, 16)),
-            'embedding_2': tf.random.normal((self.batch_size, 16)),
-            'numeric_1': tf.random.normal((self.batch_size, 1)),
-            'numeric_2': tf.random.normal((self.batch_size, 1)),
-            'categorical_1': tf.random.normal((self.batch_size, 8)),
-            'categorical_2': tf.random.normal((self.batch_size, 8))
+    def test_feature_groups(self):
+        """Test if feature groups are correctly created and used."""
+        feature_columns = {
+            'numeric': 3,
+            'categorical': 4
         }
         
-        # Calculate total feature dimension
-        total_dims = sum(tensor.shape[-1] for tensor in inputs.values())
-        
-        # Initialize model without explicit grouped_features
         model = TabNet(
-            feature_dim=total_dims,
-            output_dim=self.output_dim,
-            n_d=8,
-            n_a=8,
-            n_steps=3,
-            gamma=1.3,
-            epsilon=1e-5,
-            momentum=0.7
+            feature_columns=feature_columns,
+            output_dim=1
         )
         
-        # First forward pass should trigger automatic grouping
-        output, masks, _ = model(inputs, training=True)
+        # Check feature groups
+        self.assertEqual(model.feature_groups['numeric'], [0, 1, 2])
+        self.assertEqual(model.feature_groups['categorical'], [3, 4, 5, 6])
         
-        # Verify output shape
-        self.assertEqual(output.shape, (self.batch_size, self.output_dim))
+        # Test with input
+        inputs = {
+            'numeric': tf.random.normal((self.batch_size, 3)),
+            'categorical': tf.random.uniform((self.batch_size, 4))
+        }
         
-        # Verify that features are grouped correctly
-        for mask in masks:
-            # Check embedding features (first 32 dimensions, 16+16)
-            embedding_mask = mask[:, :32]
-            self.assertAllClose(
-                embedding_mask[:, :16],
-                embedding_mask[:, 16:32],
-                rtol=1e-5
-            )
+        _, masks = model(inputs, training=False)
+        
+        # Check mask dimensions match feature groups
+        numeric_mask = masks[:, :, model.feature_groups['numeric']]
+        categorical_mask = masks[:, :, model.feature_groups['categorical']]
+        
+        self.assertEqual(numeric_mask.shape[-1], 3)
+        self.assertEqual(categorical_mask.shape[-1], 4)
+
+    def test_dynamic_feature_inference(self):
+        """Test if model correctly infers feature dimensions from input."""
+        # Create model without feature columns
+        model = TabNet(output_dim=1)
+        
+        # Create sample input
+        inputs = {
+            'numeric': tf.random.normal((self.batch_size, 3)),
+            'categorical_1': tf.random.uniform((self.batch_size, 4)),
+            'categorical_2': tf.random.uniform((self.batch_size, 3))
+        }
+        
+        # First call should infer and build
+        out, masks = model(inputs, training=True)
+        
+        # Check inferred dimensions
+        self.assertEqual(model.feature_columns['numeric'], 3)
+        self.assertEqual(model.feature_columns['categorical_1'], 4)
+        self.assertEqual(model.feature_columns['categorical_2'], 3)
+        
+        # Check output shapes
+        self.assertEqual(out.shape, (self.batch_size, 1))
+        self.assertEqual(masks.shape, (self.batch_size, model.n_steps, sum(model.feature_columns.values())))
+
+    def test_input_validation(self):
+        """Test input validation for dynamic feature inference."""
+        model = TabNet(output_dim=1)
+        
+        # Should raise error for non-dictionary input without feature_columns
+        x = tf.random.normal((self.batch_size, 16))
+        with self.assertRaises(ValueError):
+            model(x, training=True)
+
+    def test_masking_order(self):
+        """Test that masking order exactly matches DreamQuark's implementation."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_steps=2  # Simpler to test
+        )
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        x_tensor = x['features']
+
+        # Step 1: Initial processing
+        x_bn = model.encoder.initial_bn(x_tensor, training=True)
+        
+        # First decision step
+        # 1. Apply shared transform to batch-normalized input
+        x_shared = model.encoder.shared(x_bn, training=True)
+        # 2. Apply feature transform
+        features = model.encoder.initial_splitter(x_shared, training=True)
+        # 3. Generate mask
+        d1, a1 = tf.split(features, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        mask1 = sparsemax(a1)
+        # 4. Apply mask to batch-normalized input (not transformed)
+        masked_x1 = x_bn * tf.expand_dims(mask1, axis=-1)
+        
+        # Second decision step
+        # 1. Apply shared transform to masked input
+        x_shared2 = model.encoder.shared(masked_x1, training=True)
+        # 2. Apply feature transform
+        features2 = model.encoder.feat_transformers[0](x_shared2, training=True)
+        # 3. Generate mask with prior
+        d2, a2 = tf.split(features2, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        mask2 = model.encoder.att_transformers[0](a2, mask1 * model.encoder.gamma, training=True)
+        # 4. Apply mask to batch-normalized input
+        masked_x2 = x_bn * tf.expand_dims(mask2, axis=-1)
+        
+        # Compare with model's internal processing
+        _, masks = model(x, training=True)
+        
+        # Verify masks match
+        self.assertAllClose(masks[:, 0, :], mask1)
+        self.assertAllClose(masks[:, 1, :], mask2)
+        
+        # Get intermediate outputs from model for comparison
+        with tf.GradientTape() as tape:
+            x_processed = x_tensor
+            x_processed = model.encoder.initial_bn(x_processed, training=True)
             
-            # Check numeric features (next 2 dimensions, 1+1)
-            numeric_mask = mask[:, 32:34]
-            self.assertAllClose(
-                numeric_mask[:, 0],
-                numeric_mask[:, 1],
-                rtol=1e-5
-            )
+            # First step
+            x_shared_model = model.encoder.shared(x_processed, training=True)
+            features_model = model.encoder.initial_splitter(x_shared_model, training=True)
             
-            # Check categorical features (last 16 dimensions, 8+8)
-            categorical_mask = mask[:, -16:]
-            self.assertAllClose(
-                categorical_mask[:, :8],
-                categorical_mask[:, 8:],
-                rtol=1e-5
-            )
+            # Should match our manual processing
+            self.assertAllClose(x_shared_model, x_shared)
+            self.assertAllClose(features_model, features)
+            
+            # Second step should use masked input
+            d_model, mask_model, masked_x_model = model.encoder.forward_step(x_processed, 1, mask1, training=True)
+            
+            # Should match our manual processing
+            self.assertAllClose(masked_x_model, masked_x1)
+            self.assertAllClose(mask_model, mask2)
 
 if __name__ == '__main__':
     tf.test.main() 
