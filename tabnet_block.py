@@ -1021,3 +1021,33 @@ class GhostBatchNormalization(tf.keras.layers.Layer):
         
         # Apply scale and offset
         return x * self.gamma + self.beta
+
+def entmax15(inputs, axis=-1):
+    """EntMax 1.5 activation function.
+    
+    Args:
+        inputs: Input tensor.
+        axis: Axis along which to apply entmax.
+        
+    Returns:
+        Output tensor after applying entmax 1.5.
+    """
+    # Sort inputs in descending order
+    input_sorted = tf.sort(inputs, direction='DESCENDING', axis=axis)
+    
+    # Calculate running sums
+    running_sum = tf.cumsum(input_sorted, axis=axis)
+    rho = tf.range(1, tf.shape(input_sorted)[axis] + 1, dtype=inputs.dtype)
+    
+    # Calculate threshold
+    threshold = input_sorted - ((running_sum - 1) / rho)
+    
+    # Find last positive threshold
+    is_positive = threshold > 0
+    max_k = tf.reduce_sum(tf.cast(is_positive, tf.int32), axis=axis, keepdims=True)
+    
+    # Get threshold value
+    threshold_value = tf.gather(threshold, max_k - 1, batch_dims=1)
+    
+    # Apply threshold
+    return tf.maximum(0., inputs - threshold_value)
