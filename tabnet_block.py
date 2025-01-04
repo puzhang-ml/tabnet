@@ -330,28 +330,45 @@ class TabNetEncoder(tf.keras.layers.Layer):
             # Handle TensorSpec shapes
             self.feature_columns = {}
             for name, shape in input_shape.items():
-                if hasattr(shape, 'inferred_value'):
-                    # Handle KerasTensor shapes
-                    if shape.inferred_value is None:
-                        # If inferred_value is None, use shape's last dimension or 1
-                        feature_dim = shape[-1] if len(shape) > 1 else 1
+                try:
+                    if hasattr(shape, 'inferred_value'):
+                        # Handle KerasTensor shapes
+                        if shape.inferred_value is None:
+                            # If inferred_value is None, use shape's last dimension or 1
+                            feature_dim = shape[-1] if len(shape) > 1 else 1
+                        else:
+                            # Use last dimension from inferred_value if available
+                            feature_dim = shape.inferred_value[-1]
+                            if feature_dim is None:
+                                # If last dimension is None, use 1 as default
+                                feature_dim = 1
                     else:
-                        # Use last dimension from inferred_value if available
-                        feature_dim = shape.inferred_value[-1]
+                        # Handle regular TensorShape
+                        feature_dim = shape[-1]
                         if feature_dim is None:
-                            # If last dimension is None, use 1 as default
+                            # If dimension is None, use 1 as default
                             feature_dim = 1
-                else:
-                    # Handle regular TensorShape
-                    feature_dim = shape[-1]
-                print(f"{name}: shape={shape}, dim={feature_dim}")
-                self.feature_columns[name] = feature_dim
-                
+                    
+                    print(f"{name}: shape={shape}, dim={feature_dim}")
+                    self.feature_columns[name] = feature_dim
+                    
+                except (IndexError, TypeError, AttributeError) as e:
+                    print(f"Warning: Could not determine dimension for {name}, using default dim=1")
+                    print(f"Error: {str(e)}")
+                    self.feature_columns[name] = 1
+                    
             print("\nProcessed Feature Columns:")
             print(self.feature_columns)
             
-            # Set input dimension
-            self.input_dim = sum(self.feature_columns.values())
+            # Set input dimension, ensuring all values are integers
+            try:
+                self.input_dim = sum(dim if isinstance(dim, int) else 1 
+                                   for dim in self.feature_columns.values())
+            except TypeError as e:
+                print("Error calculating input dimension:", str(e))
+                print("Feature columns:", self.feature_columns)
+                raise ValueError("Could not calculate input dimension. All feature dimensions must be integers.")
+                
             print(f"Total input dimension: {self.input_dim}")
             
             # Create feature groups

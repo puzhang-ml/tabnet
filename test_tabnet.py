@@ -1118,5 +1118,55 @@ class TabNetTest(tf.test.TestCase):
         for i, name in enumerate(sorted(input_shape.keys())):
             self.assertEqual(encoder.feature_groups[name], [i])
 
+    def test_tabnet_encoder_none_dimensions(self):
+        """Test if TabNetEncoder handles None dimensions correctly."""
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8
+        )
+        
+        class MockKerasTensor:
+            def __init__(self, shape, inferred_value=None):
+                self.shape = shape
+                self.inferred_value = inferred_value
+                
+            def __getitem__(self, idx):
+                return self.shape[idx]
+            
+            def __len__(self):
+                return len(self.shape)
+        
+        # Test cases with None dimensions
+        input_shape = {
+            'feature1': MockKerasTensor(shape=(None,), inferred_value=None),  # Should use 1
+            'feature2': MockKerasTensor(shape=(None, None), inferred_value=[None, None]),  # Should use 1
+            'feature3': tf.TensorShape([None, None]),  # Should use 1
+            'feature4': MockKerasTensor(shape=(None, 2), inferred_value=None),  # Should use 2
+            'feature5': MockKerasTensor(shape=(1,), inferred_value=[None])  # Should use 1
+        }
+        
+        # Build encoder
+        encoder.build(input_shape)
+        
+        # Verify dimensions
+        expected_dims = {
+            'feature1': 1,
+            'feature2': 1,
+            'feature3': 1,
+            'feature4': 2,
+            'feature5': 1
+        }
+        
+        # Check individual feature dimensions
+        for name, expected_dim in expected_dims.items():
+            self.assertEqual(
+                encoder.feature_columns[name],
+                expected_dim,
+                f"Feature {name} dimension mismatch. Expected {expected_dim}, got {encoder.feature_columns[name]}"
+            )
+        
+        # Check total dimension
+        self.assertEqual(encoder.input_dim, sum(expected_dims.values()))
+
 if __name__ == '__main__':
     tf.test.main() 
