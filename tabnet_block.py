@@ -14,7 +14,7 @@ class GBN(tf.keras.layers.Layer):
         
     def call(self, x, training=None):
         if training and self.virtual_batch_size is not None:
-        batch_size = tf.shape(x)[0]
+            batch_size = tf.shape(x)[0]
             n_splits = batch_size // self.virtual_batch_size
             if n_splits > 0:
                 chunks = tf.split(x[:n_splits * self.virtual_batch_size], n_splits)
@@ -25,8 +25,8 @@ class GBN(tf.keras.layers.Layer):
                     res.append(self.bn(remainder, training=training))
                 return tf.concat(res, axis=0)
             return self.bn(x, training=training)
-            return self.bn(x, training=training)
-            
+        return self.bn(x, training=training)
+
 class SharedBlock(tf.keras.layers.Layer):
     """Exactly matches DreamQuark's shared block."""
     def __init__(self, input_dim, output_dim, virtual_batch_size=128, momentum=0.02):
