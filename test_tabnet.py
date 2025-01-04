@@ -694,5 +694,97 @@ class TabNetTest(tf.test.TestCase):
         with self.assertRaises(KeyError):
             features, _ = encoder(inputs, training=True)
 
+    def test_tabnet_encoder_tensorspec_input(self):
+        """Test if TabNetEncoder handles TensorSpec inputs correctly."""
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8
+        )
+        
+        # Create TensorSpec input shapes similar to production data
+        class MockTensorSpec:
+            def __init__(self, shape, inferred_value):
+                self.shape = shape
+                self.inferred_value = inferred_value
+                
+            def __getitem__(self, idx):
+                return self.shape[idx]
+                
+        input_shape = {
+            'feature1_ctr_28day': MockTensorSpec(shape=(1,), inferred_value=[None]),
+            'feature2_industry_14day': MockTensorSpec(shape=(2,), inferred_value=[None, 1]),
+            'feature3_indicator_3day': MockTensorSpec(shape=(1,), inferred_value=[None]),
+            'feature4_posterior_28day': MockTensorSpec(shape=(1,), inferred_value=[None]),
+            'feature5_country_28day': MockTensorSpec(shape=(2,), inferred_value=[None, 1]),
+            'feature6_rate_7day': MockTensorSpec(shape=(2,), inferred_value=[None, 1])
+        }
+        
+        # Build encoder with these shapes
+        encoder.build(input_shape)
+        
+        # Verify inferred dimensions
+        self.assertEqual(encoder.input_dim, 6)  # Total dimensions
+        self.assertEqual(len(encoder.feature_columns), 6)  # Number of features
+        
+        # Check individual feature dimensions
+        expected_dims = {
+            'feature1_ctr_28day': 1,
+            'feature2_industry_14day': 1,
+            'feature3_indicator_3day': 1,
+            'feature4_posterior_28day': 1,
+            'feature5_country_28day': 1,
+            'feature6_rate_7day': 1
+        }
+        
+        for name, dim in expected_dims.items():
+            self.assertEqual(encoder.feature_columns[name], dim)
+        
+        # Check feature groups
+        start_idx = 0
+        for name in sorted(expected_dims.keys()):
+            dim = expected_dims[name]
+            expected_indices = list(range(start_idx, start_idx + dim))
+            self.assertEqual(encoder.feature_groups[name], expected_indices)
+            start_idx += dim
+
+    def test_tabnet_encoder_mixed_shapes(self):
+        """Test if TabNetEncoder handles mixed shape types correctly."""
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8
+        )
+        
+        # Mix of TensorSpec and regular shapes
+        class MockTensorSpec:
+            def __init__(self, shape, inferred_value):
+                self.shape = shape
+                self.inferred_value = inferred_value
+                
+            def __getitem__(self, idx):
+                return self.shape[idx]
+        
+        input_shape = {
+            'regular_feature1': tf.TensorShape([None, 2]),
+            'spec_feature2': MockTensorSpec(shape=(2,), inferred_value=[None, 3]),
+            'regular_feature3': tf.TensorShape([None, 1]),
+            'spec_feature4': MockTensorSpec(shape=(1,), inferred_value=[None])
+        }
+        
+        # Build encoder
+        encoder.build(input_shape)
+        
+        # Verify dimensions
+        expected_dims = {
+            'regular_feature1': 2,
+            'spec_feature2': 3,
+            'regular_feature3': 1,
+            'spec_feature4': 1
+        }
+        
+        self.assertEqual(encoder.input_dim, sum(expected_dims.values()))
+        
+        for name, dim in expected_dims.items():
+            self.assertEqual(encoder.feature_columns[name], dim)
+
 if __name__ == '__main__':
     tf.test.main() 

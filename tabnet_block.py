@@ -14,7 +14,7 @@ class GBN(tf.keras.layers.Layer):
         
     def call(self, x, training=None):
         if training and self.virtual_batch_size is not None:
-        batch_size = tf.shape(x)[0]
+            batch_size = tf.shape(x)[0]
             n_splits = batch_size // self.virtual_batch_size
             if n_splits > 0:
                 chunks = tf.split(x[:n_splits * self.virtual_batch_size], n_splits)
@@ -25,6 +25,7 @@ class GBN(tf.keras.layers.Layer):
                     res.append(self.bn(remainder, training=training))
                 return tf.concat(res, axis=0)
             return self.bn(x, training=training)
+        return self.bn(x, training=training)
             
 class SharedBlock(tf.keras.layers.Layer):
     """Exactly matches DreamQuark's shared block."""
@@ -199,26 +200,53 @@ class TabNetEncoder(tf.keras.layers.Layer):
             
     def build(self, input_shape):
         """Build model on first call with input shape information."""
-        if self.feature_columns is None and isinstance(input_shape, dict):
-            # Infer feature columns from input shape
-            self.feature_columns = {
-                name: shape[-1] for name, shape in input_shape.items()
-            }
+        print("\nTabNetEncoder Input Structure:")
+        print("Input shape:", input_shape)
+        
+        if isinstance(input_shape, dict):
+            # Handle TensorSpec shapes
+            self.feature_columns = {}
+            for name, shape in input_shape.items():
+                if hasattr(shape, 'inferred_value'):
+                    # Handle KerasTensor shapes
+                    feature_dim = shape.inferred_value[-1]
+                    if feature_dim is None:
+                        # If last dimension is None, use the shape's dimension
+                        feature_dim = shape[-1]
+                else:
+                    # Handle regular TensorShape
+                    feature_dim = shape[-1]
+                print(f"{name}: shape={shape}, dim={feature_dim}")
+                self.feature_columns[name] = feature_dim
+                
+            print("\nProcessed Feature Columns:")
+            print(self.feature_columns)
             
-        if self.feature_columns is not None:
-            self.feature_names = list(self.feature_columns.keys())
-            if self.input_dim is None:
-                self.input_dim = sum(self.feature_columns.values())
+            # Set input dimension
+            self.input_dim = sum(self.feature_columns.values())
+            print(f"Total input dimension: {self.input_dim}")
             
+            # Create feature groups
             if self.feature_groups is None:
                 self.feature_groups = self._create_feature_groups()
+                print("\nFeature Groups:")
+                for name, indices in self.feature_groups.items():
+                    print(f"{name}: {indices}")
+            
+            self.feature_names = list(self.feature_columns.keys())
 
     def _create_feature_groups(self):
         """Create feature groups based on input dictionary."""
+        if not self.feature_columns:
+            raise ValueError("feature_columns must be set before creating feature groups")
+            
         feature_groups = {}
         start_idx = 0
         
         for feature_name, feature_dim in self.feature_columns.items():
+            if not isinstance(feature_dim, int):
+                raise ValueError(f"Feature dimension for '{feature_name}' must be an integer, got {feature_dim}")
+                
             # Create indices for this feature group
             feature_indices = list(range(start_idx, start_idx + feature_dim))
             feature_groups[feature_name] = feature_indices
@@ -267,6 +295,14 @@ class TabNetEncoder(tf.keras.layers.Layer):
         return d, mask, masked_x
 
     def call(self, x, training=None):
+        # Debug prints for input tensors
+        print("\nTabNetEncoder Input Tensors:")
+        if isinstance(x, dict):
+            for name, tensor in x.items():
+                print(f"{name}: shape={tensor.shape}, dtype={tensor.dtype}")
+        else:
+            print(f"Tensor shape={x.shape}, dtype={x.dtype}")
+        
         # Preprocess dictionary input into single tensor
         if isinstance(x, dict):
             x = self._preprocess_input(x)
