@@ -185,4 +185,4 @@ for epoch in range(EPOCHS):
 sample_batch = next(iter(val_dataset))
 tabnet_output, masks = model.tabnet_encoder(sample_batch[0]['tabnet_features'])
 print("\nTabNet encoder output shape:", tabnet_output.shape)
-print("Feature masks shape:", masks.shape) 
+print("Feature masks shape:", masks.shape)

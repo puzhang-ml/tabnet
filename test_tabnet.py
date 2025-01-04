@@ -510,41 +510,53 @@ class TabNetTest(tf.test.TestCase):
         with self.assertRaises(ValueError):
             model(x, training=True)
 
-    def test_masking_order(self):
-        """Test that masking order exactly matches DreamQuark's implementation."""
+    def test_tabnet_masking_order(self):
+        """Test if masking order exactly matches DreamQuark's implementation."""
         feature_columns = {'features': self.feature_dim}
         model = TabNet(
             feature_columns=feature_columns,
             output_dim=1,
-            n_steps=2  # Simpler to test
+            n_d=8,
+            n_a=8,
+            n_steps=2  # Use 2 steps for easier testing
         )
+        
         x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
         x_tensor = x['features']
-
-        # Step 1: Initial processing
-        x_bn = model.encoder.initial_bn(x_tensor, training=True)
         
-        # First decision step
-        # 1. Apply shared transform to batch-normalized input
-        x_shared = model.encoder.shared(x_bn, training=True)
-        # 2. Apply feature transform
-        features = model.encoder.initial_splitter(x_shared, training=True)
-        # 3. Generate mask
-        d1, a1 = tf.split(features, [model.encoder.n_d, model.encoder.n_a], axis=-1)
-        mask1 = sparsemax(a1)
-        # 4. Apply mask to batch-normalized input (not transformed)
-        masked_x1 = x_bn * tf.expand_dims(mask1, axis=-1)
+        # First step verification
+        with tf.GradientTape() as tape:
+            # 1. Initial batch norm
+            x_bn = model.encoder.initial_bn(x_tensor, training=True)
+            
+            # 2. Shared transform on raw input
+            x_shared = model.encoder.shared(x_bn, training=True)
+            
+            # 3. Initial splitter
+            features = model.encoder.initial_splitter(x_shared, training=True)
+            d1, a1 = tf.split(features, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+            
+            # 4. Generate first mask
+            mask1 = sparsemax(a1)
+            
+            # 5. Apply mask to raw input
+            masked_x1 = x_bn * tf.expand_dims(mask1, axis=-1)
         
-        # Second decision step
-        # 1. Apply shared transform to masked input
-        x_shared2 = model.encoder.shared(masked_x1, training=True)
-        # 2. Apply feature transform
-        features2 = model.encoder.feat_transformers[0](x_shared2, training=True)
-        # 3. Generate mask with prior
-        d2, a2 = tf.split(features2, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        # Second step verification
+        # 1. Shared transform on raw input
+        x_shared2 = model.encoder.shared(x_bn, training=True)
+        _, a2 = tf.split(x_shared2, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        
+        # 2. Generate mask using prior
         mask2 = model.encoder.att_transformers[0](a2, mask1 * model.encoder.gamma, training=True)
-        # 4. Apply mask to batch-normalized input
+        
+        # 3. Apply mask to raw input
         masked_x2 = x_bn * tf.expand_dims(mask2, axis=-1)
+        
+        # 4. Transform masked input
+        masked_processed = model.encoder.shared(masked_x2, training=True)
+        features2 = model.encoder.feat_transformers[0](masked_processed, training=True)
+        d2, _ = tf.split(features2, [model.encoder.n_d, model.encoder.n_a], axis=-1)
         
         # Compare with model's internal processing
         _, masks = model(x, training=True)
@@ -553,25 +565,15 @@ class TabNetTest(tf.test.TestCase):
         self.assertAllClose(masks[:, 0, :], mask1)
         self.assertAllClose(masks[:, 1, :], mask2)
         
-        # Get intermediate outputs from model for comparison
-        with tf.GradientTape() as tape:
-            x_processed = x_tensor
-            x_processed = model.encoder.initial_bn(x_processed, training=True)
-            
-            # First step
-            x_shared_model = model.encoder.shared(x_processed, training=True)
-            features_model = model.encoder.initial_splitter(x_shared_model, training=True)
-            
-            # Should match our manual processing
-            self.assertAllClose(x_shared_model, x_shared)
-            self.assertAllClose(features_model, features)
-            
-            # Second step should use masked input
-            d_model, mask_model, masked_x_model = model.encoder.forward_step(x_processed, 1, mask1, training=True)
-            
-            # Should match our manual processing
-            self.assertAllClose(masked_x_model, masked_x1)
-            self.assertAllClose(mask_model, mask2)
+        # Get step-by-step outputs from model
+        d1_model, mask1_model, masked_x1_model = model.encoder.forward_step(x_bn, 0, None, training=True)
+        d2_model, mask2_model, masked_x2_model = model.encoder.forward_step(x_bn, 1, mask1_model, training=True)
+        
+        # Verify each step matches
+        self.assertAllClose(d1_model, d1)
+        self.assertAllClose(d2_model, d2)
+        self.assertAllClose(masked_x1_model, masked_x1)
+        self.assertAllClose(masked_x2_model, masked_x2)
 
     def test_tabnet_encoder_dict_input(self):
         """Test if TabNetEncoder handles dictionary inputs correctly."""
@@ -826,6 +828,295 @@ class TabNetTest(tf.test.TestCase):
                 dim, 
                 f"Feature {name} dimension mismatch. Expected {dim}, got {encoder.feature_columns[name]}"
             )
+
+    def test_tabnet_step_outputs(self):
+        """Test if each step's outputs match DreamQuark's implementation exactly."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_d=8,
+            n_a=8,
+            n_steps=3
+        )
+        
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        x_tensor = x['features']
+        x_bn = model.encoder.initial_bn(x_tensor, training=True)
+        
+        # Step 0 verification
+        # Manual processing
+        x_processed_0 = model.encoder.shared(x_bn, training=True)
+        features_0 = model.encoder.initial_splitter(x_processed_0, training=True)
+        d0, a0 = tf.split(features_0, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        mask0 = sparsemax(a0)
+        
+        # Model processing
+        d0_model, mask0_model, processed0_model = model.encoder.forward_step(x_bn, 0, None, training=True)
+        
+        # Verify step 0 outputs
+        self.assertAllClose(d0_model, d0, msg="Step 0 decision output mismatch")
+        self.assertAllClose(mask0_model, mask0, msg="Step 0 mask mismatch")
+        self.assertAllClose(processed0_model, x_processed_0, msg="Step 0 processed output mismatch")
+        
+        # Step 1 verification
+        # Manual processing
+        x_processed_1 = model.encoder.shared(x_bn, training=True)
+        _, a1 = tf.split(x_processed_1, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        mask1 = model.encoder.att_transformers[0](a1, mask0 * model.encoder.gamma, training=True)
+        masked_x1 = x_bn * tf.expand_dims(mask1, axis=-1)
+        masked_processed1 = model.encoder.shared(masked_x1, training=True)
+        features1 = model.encoder.feat_transformers[0](masked_processed1, training=True)
+        d1, _ = tf.split(features1, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        
+        # Model processing
+        d1_model, mask1_model, processed1_model = model.encoder.forward_step(x_bn, 1, mask0, training=True)
+        
+        # Verify step 1 outputs
+        self.assertAllClose(d1_model, d1, msg="Step 1 decision output mismatch")
+        self.assertAllClose(mask1_model, mask1, msg="Step 1 mask mismatch")
+        self.assertAllClose(processed1_model, masked_processed1, msg="Step 1 processed output mismatch")
+        
+        # Verify full model outputs
+        _, masks = model(x, training=True)
+        self.assertAllClose(masks[:, 0, :], mask0, msg="Model step 0 mask mismatch")
+        self.assertAllClose(masks[:, 1, :], mask1, msg="Model step 1 mask mismatch")
+
+    def test_tabnet_feature_transformations(self):
+        """Test the exact order and values of feature transformations."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_d=8,
+            n_a=8,
+            n_steps=2
+        )
+        
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        x_tensor = x['features']
+        x_bn = model.encoder.initial_bn(x_tensor, training=True)
+        
+        # Track all intermediate transformations
+        with tf.GradientTape() as tape:
+            # Step 0
+            shared_out0 = model.encoder.shared(x_bn, training=True)
+            splitter_out0 = model.encoder.initial_splitter(shared_out0, training=True)
+            d0, a0 = tf.split(splitter_out0, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+            mask0 = sparsemax(a0)
+            
+            # Step 1
+            shared_out1 = model.encoder.shared(x_bn, training=True)
+            _, a1 = tf.split(shared_out1, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+            mask1 = model.encoder.att_transformers[0](a1, mask0 * model.encoder.gamma, training=True)
+            masked_x1 = x_bn * tf.expand_dims(mask1, axis=-1)
+            masked_shared1 = model.encoder.shared(masked_x1, training=True)
+            features1 = model.encoder.feat_transformers[0](masked_shared1, training=True)
+            d1, _ = tf.split(features1, [model.encoder.n_d, model.encoder.n_a], axis=-1)
+        
+        # Get gradients to verify feature transformation flow
+        grads = tape.gradient(d1, [shared_out0, shared_out1, masked_shared1])
+        
+        # Verify gradient flow
+        self.assertIsNotNone(grads[0], "No gradient flow through initial shared transform")
+        self.assertIsNotNone(grads[1], "No gradient flow through attention shared transform")
+        self.assertIsNotNone(grads[2], "No gradient flow through masked shared transform")
+
+    def test_tabnet_edge_cases(self):
+        """Test TabNet behavior in edge cases."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_d=8,
+            n_a=8,
+            n_steps=2,
+            gamma=1.0  # No prior scaling
+        )
+        
+        # Test with zero input
+        x_zero = {'features': tf.zeros((self.batch_size, self.feature_dim))}
+        out_zero, masks_zero = model(x_zero, training=True)
+        
+        # Masks should still sum to 1
+        mask_sums = tf.reduce_sum(masks_zero, axis=-1)
+        self.assertAllClose(mask_sums, tf.ones_like(mask_sums))
+        
+        # Test with constant input
+        x_const = {'features': tf.ones((self.batch_size, self.feature_dim))}
+        out_const, masks_const = model(x_const, training=True)
+        
+        # Different samples should have same masks
+        self.assertAllClose(
+            masks_const[0], masks_const[1],
+            msg="Constant input should produce same masks"
+        )
+        
+        # Test with single feature active
+        x_single = {'features': tf.eye(self.feature_dim)[None]}
+        out_single, masks_single = model(x_single, training=True)
+        
+        # First step should focus on active feature
+        active_features = tf.argmax(masks_single[0, 0], axis=-1)
+        self.assertEqual(active_features.numpy(), 0)
+
+    def test_tabnet_step_flow(self):
+        """Test detailed step-by-step flow in TabNet."""
+        feature_columns = {'features': self.feature_dim}
+        model = TabNet(
+            feature_columns=feature_columns,
+            output_dim=1,
+            n_d=8,
+            n_a=8,
+            n_steps=3
+        )
+        
+        x = {'features': tf.random.normal((self.batch_size, self.feature_dim))}
+        
+        # Run model and get step visualizations
+        out, masks = model(x, training=True)
+        step_data = model.encoder.debug_outputs
+        
+        # Verify step 0 flow
+        step0 = step_data[0]
+        self.assertAllClose(
+            step0['masked_input'],
+            step0['raw_input'] * tf.expand_dims(step0['mask'], axis=-1)
+        )
+        
+        # Verify step 1 flow
+        step1 = step_data[1]
+        self.assertAllClose(
+            step1['mask'],
+            model.encoder.att_transformers[0](
+                step1['attention'],
+                step0['mask'] * model.encoder.gamma,
+                training=True
+            )
+        )
+        
+        # Verify feature reuse
+        feature_importance = model.encoder.get_feature_importance()
+        total_usage = tf.reduce_sum(feature_importance)
+        self.assertAllClose(total_usage, tf.constant(1.0))
+
+    def test_tabnet_encoder_kerastensor_edge_cases(self):
+        """Test if TabNetEncoder handles various KerasTensor edge cases correctly."""
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8
+        )
+        
+        class MockKerasTensor:
+            def __init__(self, shape, inferred_value=None):
+                self.shape = shape
+                self.inferred_value = inferred_value
+                
+            def __getitem__(self, idx):
+                return self.shape[idx]
+            
+            def __len__(self):
+                return len(self.shape)
+        
+        # Test various edge cases
+        input_shape = {
+            'feature1': MockKerasTensor(shape=(1,), inferred_value=None),  # Should use 1
+            'feature2': MockKerasTensor(shape=(2,), inferred_value=[None, 1]),  # Should use 1
+            'feature3': MockKerasTensor(shape=(2,), inferred_value=[None, None]),  # Should use 1
+            'feature4': MockKerasTensor(shape=(2,), inferred_value=[None, 3]),  # Should use 3
+            'feature5': MockKerasTensor(shape=(1,), inferred_value=[None]),  # Should use 1
+            'feature6': MockKerasTensor(shape=(2,), inferred_value=None)  # Should use shape[-1]=2
+        }
+        
+        # Build encoder
+        encoder.build(input_shape)
+        
+        # Verify dimensions
+        expected_dims = {
+            'feature1': 1,  # inferred_value is None, shape=(1,) -> use 1
+            'feature2': 1,  # inferred_value=[None, 1] -> use 1
+            'feature3': 1,  # inferred_value=[None, None] -> use 1
+            'feature4': 3,  # inferred_value=[None, 3] -> use 3
+            'feature5': 1,  # inferred_value=[None] -> use 1
+            'feature6': 2   # inferred_value is None, shape=(2,) -> use 2
+        }
+        
+        # Check individual feature dimensions
+        for name, expected_dim in expected_dims.items():
+            self.assertEqual(
+                encoder.feature_columns[name], 
+                expected_dim,
+                f"Feature {name} dimension mismatch. Expected {expected_dim}, got {encoder.feature_columns[name]}"
+            )
+        
+        # Check total dimension
+        self.assertEqual(encoder.input_dim, sum(expected_dims.values()))
+        
+        # Check feature groups
+        start_idx = 0
+        for name in sorted(expected_dims.keys()):
+            dim = expected_dims[name]
+            expected_indices = list(range(start_idx, start_idx + dim))
+            self.assertEqual(
+                encoder.feature_groups[name],
+                expected_indices,
+                f"Feature group indices mismatch for {name}"
+            )
+            start_idx += dim
+
+    def test_tabnet_encoder_production_shapes(self):
+        """Test TabNetEncoder with production-like KerasTensor shapes."""
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8
+        )
+        
+        class MockKerasTensor:
+            def __init__(self, shape, inferred_value):
+                self.shape = shape
+                self.inferred_value = inferred_value
+                
+            def __getitem__(self, idx):
+                return self.shape[idx]
+            
+            def __len__(self):
+                return len(self.shape)
+        
+        # Simulate production input shapes
+        input_shape = {
+            'user_ctr_28day_indicator': MockKerasTensor(
+                shape=(1,), inferred_value=[None]
+            ),
+            'adv_industry_ctr_14day': MockKerasTensor(
+                shape=(2,), inferred_value=[None, 1]
+            ),
+            'adv_industry_ctr_3day_indicator': MockKerasTensor(
+                shape=(1,), inferred_value=[None]
+            ),
+            'ad_user_posterior_100000_ctr_28day_indicator': MockKerasTensor(
+                shape=(1,), inferred_value=[None]
+            ),
+            'adv_country_dma_ctr_28day_indicator': MockKerasTensor(
+                shape=(2,), inferred_value=[None, 1]
+            ),
+            'flight_user_lng_clk_20s_rate_7day': MockKerasTensor(
+                shape=(2,), inferred_value=[None, 1]
+            )
+        }
+        
+        # Build encoder
+        encoder.build(input_shape)
+        
+        # All features should have dimension 1
+        for name, dim in encoder.feature_columns.items():
+            self.assertEqual(dim, 1, f"Feature {name} should have dimension 1")
+        
+        # Total dimension should be number of features
+        self.assertEqual(encoder.input_dim, len(input_shape))
+        
+        # Feature groups should be sequential
+        for i, name in enumerate(sorted(input_shape.keys())):
+            self.assertEqual(encoder.feature_groups[name], [i])
 
 if __name__ == '__main__':
     tf.test.main() 

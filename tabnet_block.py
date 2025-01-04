@@ -14,7 +14,7 @@ class GBN(tf.keras.layers.Layer):
         
     def call(self, x, training=None):
         if training and self.virtual_batch_size is not None:
-        batch_size = tf.shape(x)[0]
+            batch_size = tf.shape(x)[0]
             n_splits = batch_size // self.virtual_batch_size
             if n_splits > 0:
                 chunks = tf.split(x[:n_splits * self.virtual_batch_size], n_splits)
@@ -25,14 +25,14 @@ class GBN(tf.keras.layers.Layer):
                     res.append(self.bn(remainder, training=training))
                 return tf.concat(res, axis=0)
             return self.bn(x, training=training)
-            return self.bn(x, training=training)
-            
+        return self.bn(x, training=training)
+
 class SharedBlock(tf.keras.layers.Layer):
     """Exactly matches DreamQuark's shared block."""
     def __init__(self, input_dim, output_dim, virtual_batch_size=128, momentum=0.02):
         super().__init__()
         self.fc1 = tf.keras.layers.Dense(
-        output_dim,
+            output_dim,
             use_bias=False,
             kernel_initializer=lambda shape, dtype: initialize_weights(shape)
         )
@@ -198,6 +198,129 @@ class TabNetEncoder(tf.keras.layers.Layer):
                 )
             )
             
+        self.debug_outputs = {}  # For storing intermediate values
+        
+    def _log_step(self, step, **kwargs):
+        """Log intermediate values for debugging and visualization."""
+        if step not in self.debug_outputs:
+            self.debug_outputs[step] = {}
+        self.debug_outputs[step].update(kwargs)
+
+    def forward_step(self, x, step, prior, training=None):
+        """
+        DreamQuark's implementation flow:
+        
+        First step (step == 0):
+            x → shared → initial_splitter → split(d,a) → mask → masked_x
+            return (d, mask, processed_x)
+            
+        Subsequent steps:
+            x → shared → split(_,a) → mask → masked_x → shared → transformer → split(d,_)
+            return (d, mask, processed_masked_x)
+        """
+        if step == 0:
+            # First step is special in DreamQuark's implementation
+            x_processed = self.shared(x, training=training)
+            features = self.initial_splitter(x_processed, training=training)
+            d, a = tf.split(features, [self.n_d, self.n_a], axis=-1)
+            mask = sparsemax(a)
+            masked_x = x * tf.expand_dims(mask, axis=-1)
+            
+            # Log intermediate values
+            self._log_step(step,
+                raw_input=x,
+                processed_input=x_processed,
+                features=features,
+                decision=d,
+                attention=a,
+                mask=mask,
+                masked_input=masked_x)
+                
+            return d, mask, x_processed  # Return processed input for first step
+        else:
+            # Subsequent steps in DreamQuark's implementation
+            # First get attention from non-masked input
+            x_processed = self.shared(x, training=training)
+            _, a = tf.split(x_processed, [self.n_d, self.n_a], axis=-1)
+            # Generate mask using prior
+            mask = self.att_transformers[step-1](a, prior, training=training)
+            # Apply mask to raw input
+            masked_x = x * tf.expand_dims(mask, axis=-1)
+            # Transform masked input
+            masked_processed = self.shared(masked_x, training=training)
+            features = self.feat_transformers[step-1](masked_processed, training=training)
+            d, _ = tf.split(features, [self.n_d, self.n_a], axis=-1)
+            
+            # Log intermediate values
+            self._log_step(step,
+                raw_input=x,
+                attention_processed=x_processed,
+                attention=a,
+                prior=prior,
+                mask=mask,
+                masked_input=masked_x,
+                masked_processed=masked_processed,
+                features=features,
+                decision=d)
+                
+            return d, mask, masked_processed  # Return processed masked input
+
+    def get_step_visualization(self, step):
+        """Get visualization data for a specific step."""
+        if step not in self.debug_outputs:
+            return None
+        return self.debug_outputs[step]
+
+    def clear_debug_outputs(self):
+        """Clear stored debug outputs."""
+        self.debug_outputs = {}
+
+    def call(self, x, training=None):
+        # Clear previous debug outputs
+        self.clear_debug_outputs()
+        
+        # Preprocess dictionary input into single tensor
+        if isinstance(x, dict):
+            x = self._preprocess_input(x)
+            
+        # Now continue with normal processing
+        x = self.initial_bn(x, training=training)
+        
+        prior = None
+        steps_output = []
+        masks = []
+        
+        # Process steps
+        for step_i in range(self.n_steps):
+            step_out, mask, masked_x = self.forward_step(x, step_i, prior, training)
+            steps_output.append(step_out)
+            masks.append(mask)
+            
+            # Update prior
+            if step_i == 0:
+                prior = mask
+            else:
+                prior = self.gamma * mask
+            
+            # Update x for next step
+            x = masked_x
+            
+        return tf.concat(steps_output, axis=-1), tf.stack(masks, axis=1)
+
+    def get_feature_importance(self, step=None):
+        """Get feature importance for specific step or all steps."""
+        if not self.debug_outputs:
+            return None
+            
+        if step is not None:
+            if step not in self.debug_outputs:
+                return None
+            return tf.reduce_mean(self.debug_outputs[step]['mask'], axis=0)
+            
+        # Aggregate across all steps
+        all_masks = [data['mask'] for data in self.debug_outputs.values()]
+        return tf.reduce_mean(tf.stack(all_masks, axis=0), axis=[0, 1])
+
     def build(self, input_shape):
         """Build model on first call with input shape information."""
         print("\nTabNetEncoder Input Structure:")
@@ -209,10 +332,15 @@ class TabNetEncoder(tf.keras.layers.Layer):
             for name, shape in input_shape.items():
                 if hasattr(shape, 'inferred_value'):
                     # Handle KerasTensor shapes
-                    feature_dim = shape.inferred_value[-1]
-                    if feature_dim is None:
-                        # If last dimension is None, use 1 as default
-                        feature_dim = 1
+                    if shape.inferred_value is None:
+                        # If inferred_value is None, use shape's last dimension or 1
+                        feature_dim = shape[-1] if len(shape) > 1 else 1
+                    else:
+                        # Use last dimension from inferred_value if available
+                        feature_dim = shape.inferred_value[-1]
+                        if feature_dim is None:
+                            # If last dimension is None, use 1 as default
+                            feature_dim = 1
                 else:
                     # Handle regular TensorShape
                     feature_dim = shape[-1]
@@ -265,71 +393,6 @@ class TabNetEncoder(tf.keras.layers.Layer):
                 features = [inputs[name] for name in self.feature_names]
             return tf.concat(features, axis=-1)
         return inputs
-
-    def forward_step(self, x, step, prior, training=None):
-        # First step is special
-        if step == 0:
-            # DreamQuark applies shared transform to raw input first
-            x_processed = self.shared(x, training=training)
-            # Then uses shared-transformed input for initial splitter
-            features = self.initial_splitter(x_processed, training=training)
-        else:
-            # For subsequent steps, DreamQuark:
-            # 1. Applies shared transform to masked input
-            x_processed = self.shared(x, training=training)
-            # 2. Then applies feature transformer
-            features = self.feat_transformers[step-1](x_processed, training=training)
-        
-        # Split features
-        d, a = tf.split(features, [self.n_d, self.n_a], axis=-1)
-        
-        # Compute mask
-        if step == 0:
-            mask = sparsemax(a)
-        else:
-            mask = self.att_transformers[step-1](a, prior, training=training)
-        
-        # Apply mask to raw input (not processed input)
-        masked_x = x * tf.expand_dims(mask, axis=-1)
-        
-        return d, mask, masked_x
-
-    def call(self, x, training=None):
-        # Debug prints for input tensors
-        print("\nTabNetEncoder Input Tensors:")
-        if isinstance(x, dict):
-            for name, tensor in x.items():
-                print(f"{name}: shape={tensor.shape}, dtype={tensor.dtype}")
-        else:
-            print(f"Tensor shape={x.shape}, dtype={x.dtype}")
-        
-        # Preprocess dictionary input into single tensor
-        if isinstance(x, dict):
-            x = self._preprocess_input(x)
-            
-        # Now continue with normal processing
-        x = self.initial_bn(x, training=training)
-        
-        prior = None
-        steps_output = []
-        masks = []
-        
-        # Process steps
-        for step_i in range(self.n_steps):
-            step_out, mask, masked_x = self.forward_step(x, step_i, prior, training)
-            steps_output.append(step_out)
-            masks.append(mask)
-            
-            # Update prior
-            if step_i == 0:
-                prior = mask
-        else:
-                prior = self.gamma * mask
-            
-            # Update x for next step
-            x = masked_x
-            
-        return tf.concat(steps_output, axis=-1), tf.stack(masks, axis=1)
 
 class TabNet(tf.keras.Model):
     def __init__(
