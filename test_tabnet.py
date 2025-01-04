@@ -786,5 +786,46 @@ class TabNetTest(tf.test.TestCase):
         for name, dim in expected_dims.items():
             self.assertEqual(encoder.feature_columns[name], dim)
 
+    def test_tabnet_encoder_kerastensor_dimensions(self):
+        """Test if TabNetEncoder handles KerasTensor dimensions correctly."""
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8
+        )
+        
+        class MockKerasTensor:
+            def __init__(self, shape, inferred_value):
+                self.shape = shape
+                self.inferred_value = inferred_value
+                
+            def __getitem__(self, idx):
+                return self.shape[idx]
+        
+        input_shape = {
+            'feature1': MockKerasTensor(shape=(2,), inferred_value=[None, 3]),  # Should use 3
+            'feature2': MockKerasTensor(shape=(1,), inferred_value=[None]),     # Should use 1
+            'feature3': MockKerasTensor(shape=(2,), inferred_value=[None, None]), # Should use 1
+            'feature4': MockKerasTensor(shape=(2,), inferred_value=[None, 2])   # Should use 2
+        }
+        
+        encoder.build(input_shape)
+        
+        # Verify dimensions
+        expected_dims = {
+            'feature1': 3,
+            'feature2': 1,
+            'feature3': 1,
+            'feature4': 2
+        }
+        
+        self.assertEqual(encoder.input_dim, 7)  # Total should be 3+1+1+2=7
+        
+        for name, dim in expected_dims.items():
+            self.assertEqual(
+                encoder.feature_columns[name], 
+                dim, 
+                f"Feature {name} dimension mismatch. Expected {dim}, got {encoder.feature_columns[name]}"
+            )
+
 if __name__ == '__main__':
     tf.test.main() 

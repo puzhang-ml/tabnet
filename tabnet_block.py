@@ -14,7 +14,7 @@ class GBN(tf.keras.layers.Layer):
         
     def call(self, x, training=None):
         if training and self.virtual_batch_size is not None:
-            batch_size = tf.shape(x)[0]
+        batch_size = tf.shape(x)[0]
             n_splits = batch_size // self.virtual_batch_size
             if n_splits > 0:
                 chunks = tf.split(x[:n_splits * self.virtual_batch_size], n_splits)
@@ -25,7 +25,7 @@ class GBN(tf.keras.layers.Layer):
                     res.append(self.bn(remainder, training=training))
                 return tf.concat(res, axis=0)
             return self.bn(x, training=training)
-        return self.bn(x, training=training)
+            return self.bn(x, training=training)
             
 class SharedBlock(tf.keras.layers.Layer):
     """Exactly matches DreamQuark's shared block."""
@@ -158,7 +158,7 @@ class TabNetEncoder(tf.keras.layers.Layer):
         self.feature_columns = feature_columns
         self.feature_names = None
         self.feature_groups = feature_groups
-        
+
         # Initial batch norm
         self.initial_bn = tf.keras.layers.BatchNormalization(momentum=momentum)
         
@@ -211,8 +211,8 @@ class TabNetEncoder(tf.keras.layers.Layer):
                     # Handle KerasTensor shapes
                     feature_dim = shape.inferred_value[-1]
                     if feature_dim is None:
-                        # If last dimension is None, use the shape's dimension
-                        feature_dim = shape[-1]
+                        # If last dimension is None, use 1 as default
+                        feature_dim = 1
                 else:
                     # Handle regular TensorShape
                     feature_dim = shape[-1]
@@ -323,7 +323,7 @@ class TabNetEncoder(tf.keras.layers.Layer):
             # Update prior
             if step_i == 0:
                 prior = mask
-            else:
+        else:
                 prior = self.gamma * mask
             
             # Update x for next step
