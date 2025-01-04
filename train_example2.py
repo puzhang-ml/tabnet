@@ -41,9 +41,28 @@ class HybridModel(tf.keras.Model):
         tabnet_features_shape = input_shape['tabnet_features']
         if isinstance(tabnet_features_shape, dict):
             # Calculate total input dimension from dictionary of features
-            input_dim = sum(shape[-1] for shape in tabnet_features_shape.values())
+            input_dim = 0
+            for name, shape in tabnet_features_shape.items():
+                if hasattr(shape, 'inferred_value'):
+                    # Handle KerasTensor shapes
+                    if shape.inferred_value is None:
+                        # If inferred_value is None, use shape's last dimension or 1
+                        feature_dim = shape[-1] if len(shape) > 1 else 1
+                    else:
+                        # Use last dimension from inferred_value if available
+                        feature_dim = shape.inferred_value[-1]
+                        if feature_dim is None:
+                            # If last dimension is None, use 1 as default
+                            feature_dim = 1
+                else:
+                    # Handle regular TensorShape
+                    feature_dim = shape[-1] if shape[-1] is not None else 1
+                input_dim += feature_dim
         else:
+            # Handle non-dictionary input
             input_dim = tabnet_features_shape[-1]
+            if input_dim is None:
+                input_dim = 1
             
         # Now we can create the TabNetEncoder with proper input_dim
         self.tabnet_encoder = TabNetEncoder(
