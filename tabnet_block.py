@@ -11,10 +11,10 @@ class GBN(tf.keras.layers.Layer):
         super().__init__()
         self.virtual_batch_size = virtual_batch_size
         self.bn = tf.keras.layers.BatchNormalization(momentum=momentum)
-
+        
     def call(self, x, training=None):
         if training and self.virtual_batch_size is not None:
-            batch_size = tf.shape(x)[0]
+        batch_size = tf.shape(x)[0]
             n_splits = batch_size // self.virtual_batch_size
             if n_splits > 0:
                 chunks = tf.split(x[:n_splits * self.virtual_batch_size], n_splits)
@@ -24,14 +24,14 @@ class GBN(tf.keras.layers.Layer):
                 if tf.shape(remainder)[0] > 0:
                     res.append(self.bn(remainder, training=training))
                 return tf.concat(res, axis=0)
-        return self.bn(x, training=training)
-
+            return self.bn(x, training=training)
+            
 class SharedBlock(tf.keras.layers.Layer):
     """Exactly matches DreamQuark's shared block."""
     def __init__(self, input_dim, output_dim, virtual_batch_size=128, momentum=0.02):
         super().__init__()
         self.fc1 = tf.keras.layers.Dense(
-            output_dim,
+        output_dim,
             use_bias=False,
             kernel_initializer=lambda shape, dtype: initialize_weights(shape)
         )
@@ -143,7 +143,8 @@ class TabNetEncoder(tf.keras.layers.Layer):
         n_shared=2,
         virtual_batch_size=128,
         momentum=0.02,
-        feature_groups=None
+        feature_groups=None,
+        feature_columns=None
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -151,6 +152,11 @@ class TabNetEncoder(tf.keras.layers.Layer):
         self.n_a = n_a
         self.n_steps = n_steps
         self.gamma = gamma
+        
+        # Add feature handling attributes
+        self.feature_columns = feature_columns
+        self.feature_names = None
+        self.feature_groups = feature_groups
         
         # Initial batch norm
         self.initial_bn = tf.keras.layers.BatchNormalization(momentum=momentum)
@@ -181,7 +187,7 @@ class TabNetEncoder(tf.keras.layers.Layer):
                     momentum=momentum
                 )
             )
-            
+
             self.att_transformers.append(
                 AttentiveTransformer(
                     input_dim=n_a,
@@ -191,8 +197,47 @@ class TabNetEncoder(tf.keras.layers.Layer):
                 )
             )
             
-        self.feature_groups = feature_groups
+    def build(self, input_shape):
+        """Build model on first call with input shape information."""
+        if self.feature_columns is None and isinstance(input_shape, dict):
+            # Infer feature columns from input shape
+            self.feature_columns = {
+                name: shape[-1] for name, shape in input_shape.items()
+            }
+            
+        if self.feature_columns is not None:
+            self.feature_names = list(self.feature_columns.keys())
+            if self.input_dim is None:
+                self.input_dim = sum(self.feature_columns.values())
+            
+            if self.feature_groups is None:
+                self.feature_groups = self._create_feature_groups()
+
+    def _create_feature_groups(self):
+        """Create feature groups based on input dictionary."""
+        feature_groups = {}
+        start_idx = 0
         
+        for feature_name, feature_dim in self.feature_columns.items():
+            # Create indices for this feature group
+            feature_indices = list(range(start_idx, start_idx + feature_dim))
+            feature_groups[feature_name] = feature_indices
+            start_idx += feature_dim
+            
+        return feature_groups
+
+    def _preprocess_input(self, inputs):
+        """Convert dictionary input to tensor."""
+        if isinstance(inputs, dict):
+            if self.feature_names is None:
+                # If feature_names not set, use sorted keys
+                features = [inputs[name] for name in sorted(inputs.keys())]
+            else:
+                # Use predefined feature order
+                features = [inputs[name] for name in self.feature_names]
+            return tf.concat(features, axis=-1)
+        return inputs
+
     def forward_step(self, x, step, prior, training=None):
         # First step is special
         if step == 0:
@@ -222,6 +267,11 @@ class TabNetEncoder(tf.keras.layers.Layer):
         return d, mask, masked_x
 
     def call(self, x, training=None):
+        # Preprocess dictionary input into single tensor
+        if isinstance(x, dict):
+            x = self._preprocess_input(x)
+            
+        # Now continue with normal processing
         x = self.initial_bn(x, training=training)
         
         prior = None
@@ -234,7 +284,7 @@ class TabNetEncoder(tf.keras.layers.Layer):
             steps_output.append(step_out)
             masks.append(mask)
             
-            # Update prior (DreamQuark's way)
+            # Update prior
             if step_i == 0:
                 prior = mask
             else:
@@ -260,7 +310,7 @@ class TabNet(tf.keras.Model):
         momentum=0.02
     ):
         """TabNet model supporting dictionary inputs with dynamic feature inference.
-        
+
         Args:
             feature_columns: Optional[Dict[str, int]], mapping feature names to dimensions.
                            If None, will be inferred from first input.
@@ -285,7 +335,7 @@ class TabNet(tf.keras.Model):
         self.feature_groups = None
         self.encoder = None
         self.final = None
-        
+
     def build(self, input_shape):
         """Build model on first call with input shape information."""
         if self.feature_columns is None:
@@ -360,3 +410,4 @@ class TabNet(tf.keras.Model):
             x = inputs
         _, masks = self.encoder(x, training=False)
         return masks
+        

@@ -20,26 +20,46 @@ class HybridModel(tf.keras.Model):
         momentum=0.02
     ):
         super().__init__()
-        # TabNet encoder will be built dynamically
-        self.tabnet_encoder = TabNetEncoder(
-            input_dim=None,  # Will be set on first call
-            output_dim=n_d * n_steps,  # Final output dimension
-            n_d=n_d,
-            n_a=n_a,
-            n_steps=n_steps,
-            gamma=gamma,
-            n_independent=n_independent,
-            n_shared=n_shared,
-            virtual_batch_size=virtual_batch_size,
-            momentum=momentum
-        )
+        # Store parameters for later use
+        self.n_d = n_d
+        self.n_a = n_a
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.n_independent = n_independent
+        self.n_shared = n_shared
+        self.virtual_batch_size = virtual_batch_size
+        self.momentum = momentum
         
-        # Additional features processing
+        # These will be built in build() method
+        self.tabnet_encoder = None
         self.additional_dense = tf.keras.layers.Dense(32)
-        
-        # Final layers
         self.concat_bn = tf.keras.layers.BatchNormalization()
         self.final_dense = tf.keras.layers.Dense(1)
+
+    def build(self, input_shape):
+        # Get input dimensions from the tabnet_features shape
+        tabnet_features_shape = input_shape['tabnet_features']
+        if isinstance(tabnet_features_shape, dict):
+            # Calculate total input dimension from dictionary of features
+            input_dim = sum(shape[-1] for shape in tabnet_features_shape.values())
+        else:
+            input_dim = tabnet_features_shape[-1]
+            
+        # Now we can create the TabNetEncoder with proper input_dim
+        self.tabnet_encoder = TabNetEncoder(
+            input_dim=input_dim,
+            output_dim=self.n_d * self.n_steps,
+            n_d=self.n_d,
+            n_a=self.n_a,
+            n_steps=self.n_steps,
+            gamma=self.gamma,
+            n_independent=self.n_independent,
+            n_shared=self.n_shared,
+            virtual_batch_size=self.virtual_batch_size,
+            momentum=self.momentum
+        )
+        
+        super().build(input_shape)
 
     def call(self, inputs, training=None):
         # Split inputs into tabnet features and additional features

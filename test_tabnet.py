@@ -573,5 +573,126 @@ class TabNetTest(tf.test.TestCase):
             self.assertAllClose(masked_x_model, masked_x1)
             self.assertAllClose(mask_model, mask2)
 
+    def test_tabnet_encoder_dict_input(self):
+        """Test if TabNetEncoder handles dictionary inputs correctly."""
+        # Create encoder with dynamic feature inference
+        encoder = TabNetEncoder(
+            input_dim=None,  # Will be inferred
+            output_dim=8,
+            n_d=4,
+            n_a=4,
+            n_steps=3
+        )
+        
+        # Create dictionary input
+        inputs = {
+            'numeric': tf.random.normal((self.batch_size, 3)),
+            'categorical': tf.random.uniform((self.batch_size, 4)),
+            'binary': tf.random.uniform((self.batch_size, 2))
+        }
+        
+        # First call should build and infer dimensions
+        features, masks = encoder(inputs, training=True)
+        
+        # Check inferred dimensions
+        self.assertEqual(encoder.input_dim, 9)  # 3 + 4 + 2
+        self.assertEqual(len(encoder.feature_columns), 3)
+        self.assertEqual(encoder.feature_columns['numeric'], 3)
+        self.assertEqual(encoder.feature_columns['categorical'], 4)
+        self.assertEqual(encoder.feature_columns['binary'], 2)
+        
+        # Check output shapes
+        self.assertEqual(features.shape, (self.batch_size, encoder.n_d * encoder.n_steps))
+        self.assertEqual(masks.shape, (self.batch_size, encoder.n_steps, encoder.input_dim))
+
+    def test_tabnet_encoder_feature_groups(self):
+        """Test if TabNetEncoder creates and uses feature groups correctly."""
+        feature_columns = {
+            'numeric': 3,
+            'categorical': 4,
+            'binary': 2
+        }
+        
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8,
+            feature_columns=feature_columns
+        )
+        
+        inputs = {
+            'numeric': tf.random.normal((self.batch_size, 3)),
+            'categorical': tf.random.uniform((self.batch_size, 4)),
+            'binary': tf.random.uniform((self.batch_size, 2))
+        }
+        
+        # Get outputs and check feature groups
+        _, masks = encoder(inputs, training=True)
+        
+        # Check feature groups were created correctly
+        self.assertEqual(encoder.feature_groups['numeric'], [0, 1, 2])
+        self.assertEqual(encoder.feature_groups['categorical'], [3, 4, 5, 6])
+        self.assertEqual(encoder.feature_groups['binary'], [7, 8])
+        
+        # Check mask dimensions match feature groups
+        numeric_mask = masks[:, :, encoder.feature_groups['numeric']]
+        categorical_mask = masks[:, :, encoder.feature_groups['categorical']]
+        binary_mask = masks[:, :, encoder.feature_groups['binary']]
+        
+        self.assertEqual(numeric_mask.shape[-1], 3)
+        self.assertEqual(categorical_mask.shape[-1], 4)
+        self.assertEqual(binary_mask.shape[-1], 2)
+
+    def test_tabnet_encoder_feature_order(self):
+        """Test if TabNetEncoder maintains consistent feature order."""
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8
+        )
+        
+        # Create inputs with different order
+        inputs1 = {
+            'c': tf.random.normal((self.batch_size, 2)),
+            'a': tf.random.normal((self.batch_size, 2)),
+            'b': tf.random.normal((self.batch_size, 2))
+        }
+        
+        inputs2 = {
+            'a': tf.random.normal((self.batch_size, 2)),
+            'b': tf.random.normal((self.batch_size, 2)),
+            'c': tf.random.normal((self.batch_size, 2))
+        }
+        
+        # Get outputs
+        features1, _ = encoder(inputs1, training=True)
+        features2, _ = encoder(inputs2, training=True)
+        
+        # Features should be same regardless of input order
+        # (because we sort keys when feature_names is None)
+        self.assertAllClose(features1, features2)
+
+    def test_tabnet_encoder_missing_features(self):
+        """Test if TabNetEncoder handles missing features correctly."""
+        feature_columns = {
+            'a': 2,
+            'b': 2,
+            'c': 2
+        }
+        
+        encoder = TabNetEncoder(
+            input_dim=None,
+            output_dim=8,
+            feature_columns=feature_columns
+        )
+        
+        # Try input with missing feature
+        inputs = {
+            'a': tf.random.normal((self.batch_size, 2)),
+            'c': tf.random.normal((self.batch_size, 2))
+        }
+        
+        # Should raise error because 'b' is missing
+        with self.assertRaises(KeyError):
+            features, _ = encoder(inputs, training=True)
+
 if __name__ == '__main__':
     tf.test.main() 
